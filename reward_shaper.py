@@ -1,370 +1,160 @@
+from __future__ import annotations
+
 import numpy as np
 
 
 class RewardShaper:
-    """Per-episode stateful reward shaper for OBELIX.
+    """Stateful per-episode reward shaper for OBELIX.
 
-    Drop-in replacement for the current shaper.
-    Designed for PPO + LSTM in a partially observable setting.
+    Takes the encoded observation from BeliefStateEncoder (38-dim) to access
+    richer features than raw bits allow.
 
-    Main ideas added:
-      1. Memory-style shaping for blinking box:
-         reward short-horizon motion consistent with the last seen box direction.
-      2. Anti-oscillation:
-         penalise rapid left-right alternation.
-      3. Recovery bonus:
-         reward escaping from stuck states.
-      4. IR progress:
-         reward first acquisition / reacquisition of frontal IR.
-      5. Wall-vs-box disambiguation:
-         penalise persistent unchanged detections when not attached.
-      6. Push alignment:
-         slightly reward sensible forward pushing once attached.
+    Encoded layout (must match BeliefStateEncoder.encode output):
+        [0:18]  raw obs  (sonar bits 0-15, IR bit 16, stuck bit 17)
+        [18:26] sector strengths  (2*near + far, per sector)
+        [26:29] direction summary (left, front, right)
+        [29]    steps_since_seen  (normalised 0-1)
+        [30]    stuck_steps       (normalised 0-1)
+        [31]    just_got_ir       (1 on IR rising edge)
+        [32]    just_recovered    (1 on stuck falling edge)
+        [33:38] prev_action one-hot
+
+    Shaping terms:
+        1. Front alignment bonus  — front strength increasing (find phase)
+        2. IR contact bonus       — one-shot on just_got_ir (pre-attach)
+        3. Push progress          — each non-stuck FW step while attached
+        4. Escalating stuck penalty — grows with stuck_steps duration
+        5. Recovery bonus         — just_recovered fires
+        6. Spin penalty           — escalating after spin_threshold rotations
+        7. Forward bonus          — prefer FW over spinning (find phase)
+        8. Search pressure        — gentle penalty when box unseen for long
+        9. Efficiency bonus       — one-time at success, scales with steps saved
     """
+
+    # Indices into the 38-dim encoded vector
+    _IR_BIT         = 16
+    _STUCK_BIT      = 17
+    _STR_FRONT_START = 20   # strengths[2] = sectors 2..5 = front fan
+    _STR_FRONT_END   = 24
+    _DIR_FRONT      = 27    # direction_summary[1] = front aggregate
+    _STEPS_SINCE_SEEN = 29
+    _STUCK_STEPS    = 30
+    _JUST_GOT_IR    = 31
+    _JUST_RECOVERED = 32
 
     def __init__(
         self,
-        max_steps: int = 1000,
-        reward_scale: float = 10.0,
-
-        # Existing core shaping
-        approach_scale: float = 2.0,
-        push_scale: float = 3.0,
-        stuck_penalty: float = 1.0,
-        explore_scale: float = 0.5,
-        efficiency_bonus: float = 50.0,
-        forward_bonus: float = 1.0,
-        spin_penalty: float = 3.0,
-        spin_threshold: int = 5,
-        boundary_penalty: float = 3.0,
-        boundary_threshold: int = 10,
-
-        # New POMDP-focused shaping
-        track_scale: float = 1.5,              # reward short-horizon motion toward last seen box dir
-        track_memory_steps: int = 6,           # how long to keep rewarding tracking after box vanishes
-        ir_bonus: float = 2.0,                 # bonus when IR is acquired/reacquired
-        recovery_bonus: float = 2.5,           # reward when agent escapes stuck state
-        oscillation_penalty: float = 1.5,      # penalty for L<->R oscillation
-        stability_bonus: float = 0.4,          # small bonus for stable consistent detections
-        persistence_penalty: float = 2.0,      # penalty for unchanged detection too long (likely wall)
-        persistence_threshold: int = 6,        # unchanged steps before persistence penalty starts
-        push_forward_bonus: float = 1.5,       # reward for moving forward while attached
-        blind_push_penalty: float = 1.0,       # pushing blindly without useful frontal evidence
+        reward_scale:       float = 20.0,
+        approach_scale:     float = 2.0,   # general approach bonus (not just front)
+        front_align_scale:  float = 3.0,   # approach via front specifically
+        ir_contact_bonus:   float = 5.0,   # one-shot on IR rising edge
+        push_scale:         float = 4.0,   # per non-stuck push step
+        stuck_penalty:      float = 3.0,   # base; multiplied by stuck_steps
+        recovery_bonus:     float = 2.0,   # on just_recovered
+        spin_penalty:       float = 2.0,   # escalating per extra rotation
+        spin_threshold:     int   = 6,
+        forward_bonus:      float = 1.0,   # per FW step in find phase
+        search_pressure:    float = 1.0,   # penalty scaled by steps_since_seen
+        efficiency_bonus:   float = 10.0,
+        max_steps:          int   = 1000,
     ):
-        self.max_steps = max_steps
-        self.reward_scale = reward_scale
-
-        self.approach_scale = approach_scale
-        self.push_scale = push_scale
-        self.stuck_penalty = stuck_penalty
-        self.explore_scale = explore_scale
-        self.efficiency_bonus = efficiency_bonus
-        self.forward_bonus = forward_bonus
-        self.spin_penalty = spin_penalty
-        self.spin_threshold = spin_threshold
-        self.boundary_penalty = boundary_penalty
-        self.boundary_threshold = boundary_threshold
-
-        self.track_scale = track_scale
-        self.track_memory_steps = track_memory_steps
-        self.ir_bonus = ir_bonus
-        self.recovery_bonus = recovery_bonus
-        self.oscillation_penalty = oscillation_penalty
-        self.stability_bonus = stability_bonus
-        self.persistence_penalty = persistence_penalty
-        self.persistence_threshold = persistence_threshold
-        self.push_forward_bonus = push_forward_bonus
-        self.blind_push_penalty = blind_push_penalty
-
-        # Internal episode state
+        self.reward_scale      = reward_scale
+        self.approach_scale    = approach_scale
+        self.front_align_scale = front_align_scale
+        self.ir_contact_bonus  = ir_contact_bonus
+        self.push_scale        = push_scale
+        self.stuck_penalty     = stuck_penalty
+        self.recovery_bonus    = recovery_bonus
+        self.spin_penalty      = spin_penalty
+        self.spin_threshold    = spin_threshold
+        self.forward_bonus     = forward_bonus
+        self.search_pressure   = search_pressure
+        self.efficiency_bonus  = efficiency_bonus
+        self.max_steps         = max_steps
         self.reset()
 
     def reset(self) -> None:
-        self._prev_sonar_count = 0
-        self._prev_ir = 0
-        self._prev_stuck = 0
-        self._seen_patterns = set()
-        self._step_count = 0
+        self._prev_front_strength = 0.0
+        self._consec_rotations    = 0
+        self._step_count          = 0
 
-        self._consec_rotations = 0
-        self._consec_stuck = 0
-        self._steps_at_boundary = 0
-
-        self._prev_action = None
-
-        # Tracking memory for blinking / moving target
-        self._last_seen_dir = None
-        self._steps_since_seen = 10**9
-
-        # Persistence / stability
-        self._prev_pattern = None
-        self._same_pattern_steps = 0
-        self._stable_detection_steps = 0
-
-    # ------------------------------------------------------------------
-    # Direction helpers
-    # ------------------------------------------------------------------
-    def _sector_strengths(self, obs: np.ndarray) -> np.ndarray:
-        """Collapse 16 sonar bits into 8 directional sector strengths.
-
-        For each sector:
-            strength = 2 * near_bit + 1 * far_bit
-        So near detections are treated as stronger / more reliable than far.
-        """
-        near = obs[:8].astype(np.float32)
-        far = obs[8:16].astype(np.float32)
-        return 2.0 * near + 1.0 * far
-
-    def _best_sector(self, obs: np.ndarray):
-        """Return most likely box direction sector index in [0..7], or None."""
-        strengths = self._sector_strengths(obs)
-        if strengths.sum() <= 0:
-            return None
-        return int(np.argmax(strengths))
-
-    def _action_matches_direction(self, action: str, sector: int) -> bool:
-        """Coarse action-direction heuristic.
-
-        We do not know exact geometric mapping of sensor sector IDs here,
-        so use a simple front/left/right partition:
-
-          sectors near front:        0, 1, 7
-          sectors on left side:      2, 3
-          sectors on right side:     5, 6
-          ambiguous / rear-ish:      4
-
-        Then reward actions that roughly make sense for that remembered side.
-        """
-        front = {0, 1, 7}
-        left = {2, 3}
-        right = {5, 6}
-        rearish = {4}
-
-        if sector in front:
-            return action == "FW"
-        if sector in left:
-            return action in {"L22", "L45"}
-        if sector in right:
-            return action in {"R22", "R45"}
-        if sector in rearish:
-            return action in {"L45", "R45"}
-        return False
-
-    def _is_opposite_turn(self, prev_action: str, action: str) -> bool:
-        opposite_pairs = {
-            ("L22", "R22"), ("R22", "L22"),
-            ("L45", "R45"), ("R45", "L45"),
-            ("L22", "R45"), ("R45", "L22"),
-            ("L45", "R22"), ("R22", "L45"),
-        }
-        return (prev_action, action) in opposite_pairs
-
-    # ------------------------------------------------------------------
     def shape(
         self,
-        raw_reward: float,
-        obs: np.ndarray,
-        done: bool,
-        enable_push: bool,
-        action: str = "FW",
+        raw_reward:   float,
+        encoded_obs:  np.ndarray,   # 38-dim output of BeliefStateEncoder.encode()
+        done:         bool,
+        enable_push:  bool,
+        action:       str = "FW",
     ) -> float:
-        """Return shaped reward.
-
-        Parameters
-        ----------
-        raw_reward : float
-            In your trainer this is already scaled before calling shape():
-                scaled = raw_reward / reward_scale
-            so here it is the working reward we modify.
-        obs : np.ndarray
-            18-dim observation.
-        done : bool
-        enable_push : bool
-            External attachment/push mode flag tracked by trainer.
-        action : str
-            One of {"L45", "L22", "FW", "R22", "R45"}.
+        """
+        raw_reward:  already divided by reward_scale by the caller.
+        encoded_obs: full 38-dim encoded vector from BeliefStateEncoder.
+        Returns the shaped reward (same scale as raw_reward).
         """
         r = float(raw_reward)
+        s = self.reward_scale
 
-        sonar_bits = obs[:16]
-        ir_bit = int(obs[16])
-        stuck_bit = int(obs[17])
+        stuck          = bool(encoded_obs[self._STUCK_BIT])
+        front_strength = float(encoded_obs[self._DIR_FRONT])
+        steps_since_seen = float(encoded_obs[self._STEPS_SINCE_SEEN])   # normed 0-1
+        stuck_steps    = float(encoded_obs[self._STUCK_STEPS])          # normed 0-1
+        just_got_ir    = bool(encoded_obs[self._JUST_GOT_IR])
+        just_recovered = bool(encoded_obs[self._JUST_RECOVERED])
 
         self._step_count += 1
 
-        sonar_count = int(sonar_bits.sum())
-        pattern = tuple(obs.astype(int))
-        sector = self._best_sector(obs)
+        # 1. Front alignment bonus (find phase)
+        # Reward the box moving into the front sector specifically — directly
+        # shapes the agent to face the box, which is necessary for IR and attach.
+        if not enable_push and front_strength > self._prev_front_strength:
+            delta = front_strength - self._prev_front_strength
+            r += self.front_align_scale * delta / s
 
-        # --------------------------------------------------------------
-        # 1. Approach bonus: more sonar evidence before push
-        # --------------------------------------------------------------
-        if sonar_count > self._prev_sonar_count and not enable_push:
-            delta = sonar_count - self._prev_sonar_count
-            r += self.approach_scale * delta / self.reward_scale
+        # 2. IR contact bonus (one-shot, find phase)
+        # IR fires only when the box is directly ahead at near range.
+        # A rising edge means the agent just aligned perfectly — strong signal.
+        if just_got_ir and not enable_push:
+            r += self.ir_contact_bonus / s
 
-        # --------------------------------------------------------------
-        # 2. Tracking bonus for blinking / temporarily invisible box
-        # --------------------------------------------------------------
-        # If box is visible now, refresh remembered direction.
-        if sector is not None:
-            self._last_seen_dir = sector
-            self._steps_since_seen = 0
-        else:
-            self._steps_since_seen += 1
-
-        # If box vanished recently, reward actions consistent with last seen side.
-        if (
-            not enable_push
-            and self._last_seen_dir is not None
-            and 0 < self._steps_since_seen <= self.track_memory_steps
-        ):
-            if self._action_matches_direction(action, self._last_seen_dir):
-                r += self.track_scale / self.reward_scale
-
-        # --------------------------------------------------------------
         # 3. Push progress
-        # --------------------------------------------------------------
-        if enable_push and not stuck_bit and not done:
-            r += self.push_scale / self.reward_scale
+        if enable_push and not stuck and not done:
+            r += self.push_scale / s
 
-        # --------------------------------------------------------------
-        # 4. Push alignment shaping
-        # --------------------------------------------------------------
-        if enable_push:
-            if action == "FW" and not stuck_bit:
-                r += self.push_forward_bonus / self.reward_scale
+        # 4. Escalating stuck penalty
+        # stuck_steps is normalised [0,1]: 0 = just got stuck, 1 = stuck for
+        # max_stuck_steps. Flat penalty at low duration, grows as trap persists.
+        if stuck:
+            r -= self.stuck_penalty * (1.0 + stuck_steps) / s
 
-            # Blind / weakly informed pushing penalty before terminal success
-            # Encourage agent to avoid random pushing when frontal evidence is poor.
-            front_near = int(obs[0]) if len(obs) >= 1 else 0
-            front_far = int(obs[8]) if len(obs) >= 9 else 0
-            if action == "FW" and (front_near + front_far + ir_bit == 0) and not done:
-                r -= self.blind_push_penalty / self.reward_scale
+        # 5. Recovery bonus
+        if just_recovered:
+            r += self.recovery_bonus / s
 
-        # --------------------------------------------------------------
-        # 5. Stuck penalty + boundary penalty
-        # --------------------------------------------------------------
-        if stuck_bit:
-            self._consec_stuck += 1
-            r -= self.stuck_penalty / self.reward_scale
-
-            if not enable_push:
-                self._steps_at_boundary += 1
-            else:
-                self._steps_at_boundary = 0
-        else:
-            self._consec_stuck = 0
-            self._steps_at_boundary = 0
-
-        if self._steps_at_boundary >= self.boundary_threshold and not enable_push:
-            extra = (
-                self.boundary_penalty
-                * (self._steps_at_boundary - self.boundary_threshold + 1)
-                / self.reward_scale
-            )
-            r -= extra
-
-        # --------------------------------------------------------------
-        # 6. Recovery bonus: escaped from stuck
-        # --------------------------------------------------------------
-        if self._prev_stuck == 1 and stuck_bit == 0:
-            r += self.recovery_bonus / self.reward_scale
-
-        # --------------------------------------------------------------
-        # 7. Forward movement bonus while searching
-        # --------------------------------------------------------------
-        if action == "FW" and not stuck_bit and not enable_push:
-            r += self.forward_bonus / self.reward_scale
-
-        # --------------------------------------------------------------
-        # 8. Spin penalty
-        # --------------------------------------------------------------
-        ROTATE = {"L45", "L22", "R22", "R45"}
-        if action in ROTATE and not enable_push:
+        # 6. Spin penalty (find phase)
+        if action in {"L45", "L22", "R22", "R45"} and not enable_push:
             self._consec_rotations += 1
         else:
             self._consec_rotations = 0
 
-        if self._consec_rotations > self.spin_threshold and not enable_push:
-            r -= (
-                self.spin_penalty
-                * (self._consec_rotations - self.spin_threshold)
-                / self.reward_scale
-            )
+        if self._consec_rotations > self.spin_threshold:
+            excess = self._consec_rotations - self.spin_threshold
+            r -= self.spin_penalty * excess / s
 
-        # --------------------------------------------------------------
-        # 9. Anti-oscillation penalty: L-R-L-R behavior
-        # --------------------------------------------------------------
-        if (
-            not enable_push
-            and self._prev_action is not None
-            and self._is_opposite_turn(self._prev_action, action)
-        ):
-            r -= self.oscillation_penalty / self.reward_scale
+        # 7. Forward bonus (find phase)
+        if action == "FW" and not stuck and not enable_push:
+            r += self.forward_bonus / s
 
-        # --------------------------------------------------------------
-        # 10. IR progress bonus
-        # --------------------------------------------------------------
-        if ir_bit == 1 and self._prev_ir == 0 and not enable_push:
-            r += self.ir_bonus / self.reward_scale
+        # 8. Search pressure (find phase)
+        # When the box has been invisible for a long time, gently penalise
+        # standing still or spinning. steps_since_seen=1.0 means the agent
+        # hasn't seen the box for max_steps_since_seen steps — escalate then.
+        if not enable_push and steps_since_seen > 0.5:
+            r -= self.search_pressure * (steps_since_seen - 0.5) / s
 
-        # --------------------------------------------------------------
-        # 11. Stability bonus for short consistent detections
-        # --------------------------------------------------------------
-        # Reward brief consistency, but not endless persistence.
-        current_sonar_pattern = tuple(sonar_bits.astype(int))
-        if sonar_count > 0 and current_sonar_pattern == self._prev_pattern:
-            self._stable_detection_steps += 1
-            if 1 <= self._stable_detection_steps <= 3 and not enable_push:
-                r += self.stability_bonus / self.reward_scale
-        else:
-            self._stable_detection_steps = 0
+        # 9. Efficiency bonus at success
+        if done and raw_reward > 0:
+            efficiency = max(0.0, 1.0 - self._step_count / self.max_steps)
+            r += self.efficiency_bonus * efficiency / s
 
-        # --------------------------------------------------------------
-        # 12. Persistence penalty: likely staring at wall
-        # --------------------------------------------------------------
-        # If same detection repeats too long without push/attachment,
-        # discourage continuing the same behavior.
-        if current_sonar_pattern == self._prev_pattern and sonar_count > 0 and not enable_push:
-            self._same_pattern_steps += 1
-        else:
-            self._same_pattern_steps = 0
-
-        if self._same_pattern_steps >= self.persistence_threshold and not enable_push:
-            extra = (
-                self.persistence_penalty
-                * (self._same_pattern_steps - self.persistence_threshold + 1)
-                / self.reward_scale
-            )
-            r -= extra
-
-        # --------------------------------------------------------------
-        # 13. Novelty bonus
-        # --------------------------------------------------------------
-        if not enable_push:
-            sonar_pattern_only = tuple(sonar_bits.astype(int))
-            if sonar_pattern_only not in self._seen_patterns:
-                self._seen_patterns.add(sonar_pattern_only)
-                r += self.explore_scale / self.reward_scale
-
-        # --------------------------------------------------------------
-        # 14. Efficiency bonus on successful termination
-        # --------------------------------------------------------------
-        # In your trainer, the shaped reward function receives raw_reward already
-        # divided by reward_scale, so success detection must still use the scaled
-        # threshold. Your original code used raw_reward >= 1.0 for scale=10. :contentReference[oaicite:1]{index=1}
-        if done and raw_reward >= 1.0:
-            efficiency = max(0.0, 1.0 - (self._step_count / self.max_steps))
-            r += self.efficiency_bonus * efficiency / self.reward_scale
-
-        # --------------------------------------------------------------
-        # Update internal state for next step
-        # --------------------------------------------------------------
-        self._prev_sonar_count = sonar_count
-        self._prev_ir = ir_bit
-        self._prev_stuck = stuck_bit
-        self._prev_pattern = current_sonar_pattern
-        self._prev_action = action
-
+        self._prev_front_strength = front_strength
         return r

@@ -40,6 +40,8 @@ from torch.distributions import Categorical
 from tqdm import tqdm
 
 from vec_env import VecEnv
+from reward_shaper import RewardShaper
+from state_encoder import BeliefStateEncoder
 
 
 # ── Device ─────────────────────────────────────────────────────────────────────
@@ -60,186 +62,6 @@ DEVICE  = get_device()
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
 N_ACT   = len(ACTIONS)
 
-
-# ── Frame stacker ──────────────────────────────────────────────────────────────
-class FrameStack:
-    """Stacks the last k observations into a single flat vector.
-
-    One instance per worker, kept in the main process.
-    obs_dim = 18 * k  (e.g. 18 * 8 = 144 for k=8)
-    """
-
-    def __init__(self, k: int, obs_dim: int = 18):
-        self.k       = k
-        self.obs_dim = obs_dim
-        self.frames  = collections.deque(maxlen=k)
-
-    def reset(self, obs: np.ndarray) -> np.ndarray:
-        if obs.shape[0] != self.obs_dim:
-            raise ValueError(
-                f"FrameStack expected obs of length {self.obs_dim}, "
-                f"got {obs.shape[0]}. Check --stack and the env's obs space."
-            )
-        for _ in range(self.k):
-            self.frames.append(obs.copy())
-        return self._get()
-
-    def step(self, obs: np.ndarray) -> np.ndarray:
-        if obs.shape[0] != self.obs_dim:
-            raise ValueError(
-                f"FrameStack expected obs of length {self.obs_dim}, "
-                f"got {obs.shape[0]}."
-            )
-        self.frames.append(obs.copy())
-        return self._get()
-
-    def _get(self) -> np.ndarray:
-        return np.concatenate(list(self.frames), axis=0).astype(np.float32)
-
-    @property
-    def stacked_dim(self) -> int:
-        return self.obs_dim * self.k
-
-
-# ── Reward shaper ──────────────────────────────────────────────────────────────
-class RewardShaper:
-    """Per-episode stateful reward shaper.  One instance per worker.
-
-    All bonuses are expressed in the same units as the already-scaled reward
-    (divided by reward_scale) so they are comparable in magnitude.
-
-    Signals:
-      1. Approach bonus  — reward increase in active sonar bits (find phase)
-      2. Push progress   — reward each step in push state without being stuck
-      3. Stuck penalty   — extra penalty on top of env's -200/scale
-      4. Novelty bonus   — tiny reward for a new sonar bit-pattern (find phase)
-    """
-
-    def __init__(
-    self,
-    approach_scale:      float = 2.0,     # was 0.3
-    push_scale:          float = 3.0,     # was 0.5
-    stuck_penalty:       float = 1.0,
-    explore_scale:       float = 0.5,     # was 0.05
-    efficiency_bonus:    float = 50.0,    # was 5.0
-    forward_bonus:       float = 1.0,     # was 0.1
-    spin_penalty:        float = 3.0,     # was 0.5
-    spin_threshold:      int   = 5,       # was 8
-    boundary_penalty:    float = 3.0,     # NEW
-    boundary_threshold:  int   = 10,      # NEW
-    max_steps:           int   = 1000,
-    reward_scale:        float = 10.0,    # was 100.0
-):
-        self.approach_scale  = approach_scale
-        self.push_scale      = push_scale
-        self.stuck_penalty   = stuck_penalty
-        self.explore_scale   = explore_scale
-        self.efficiency_bonus = efficiency_bonus
-        self.forward_bonus   = forward_bonus
-        self.spin_penalty    = spin_penalty
-        self.spin_threshold  = spin_threshold
-        self.max_steps       = max_steps
-        self.reward_scale    = reward_scale
-
-        self._prev_sonar_count   = 0
-        self._prev_push_state    = False
-        self._seen_patterns: set = set()
-        self._prev_obs: np.ndarray = np.zeros(18)
-        self._step_count: int    = 0
-        self._consec_rotations: int = 0  
-        self._steps_at_boundary: int = 0   
-        self.boundary_penalty   = boundary_penalty
-        self.boundary_threshold = boundary_threshold
-
-    def reset(self) -> None:
-        self._prev_sonar_count  = 0
-        self._prev_push_state   = False
-        self._seen_patterns     = set()
-        self._prev_obs          = np.zeros(18)
-        self._step_count        = 0
-        self._consec_rotations  = 0   
-        self._steps_at_boundary = 0
-
-    def shape(
-        self,
-        raw_reward:  float,
-        obs:         np.ndarray,
-        done:        bool,
-        enable_push: bool,
-        action: str = "FW",    # NEW: pass the action string taken this step
-    ) -> float:
-        """raw_reward is already divided by reward_scale by the caller."""
-        r          = raw_reward
-        sonar_bits = obs[:16]
-        stuck_bit  = obs[17]
-
-        self._step_count += 1
-
-        # ── 1. Approach bonus (find phase only) ───────────────────────────
-        sonar_count = int(sonar_bits.sum())
-        if sonar_count > self._prev_sonar_count and not enable_push:
-            r += self.approach_scale * (sonar_count - self._prev_sonar_count) / self.reward_scale
-        self._prev_sonar_count = sonar_count
-
-        # ── 2. Push progress bonus ────────────────────────────────────────
-        if enable_push and not stuck_bit and not done:
-            r += self.push_scale / self.reward_scale
-
-        # ── 3. Extra stuck penalty ────────────────────────────────────────
-        if stuck_bit:
-            self._consec_stuck += 1
-            r -= self.stuck_penalty / self.reward_scale
-            if not enable_push:
-                self._steps_at_boundary += 1
-            else:
-                self._steps_at_boundary = 0
-        else:
-            self._consec_stuck      = 0
-            self._steps_at_boundary = 0
-
-        # ── 4. Forward movement bonus (NEW) ──────────────────────────────
-        # Reward moving forward when not stuck — directly incentivises
-        # exploration over spinning in place.
-        if action == "FW" and not stuck_bit and not enable_push:
-            r += self.forward_bonus / self.reward_scale
-
-        # ── 5. Spin penalty (NEW) ─────────────────────────────────────────
-        # Track consecutive rotations. After spin_threshold in a row,
-        # apply a penalty each additional step to break the spin loop.
-        ROTATE_ACTIONS = {"L45", "L22", "R22", "R45"}
-        if action in ROTATE_ACTIONS and not enable_push:
-            self._consec_rotations += 1
-        else:
-            self._consec_rotations = 0   # reset on any forward step
-
-        if self._consec_rotations > self.spin_threshold and not enable_push:
-            r -= self.spin_penalty * (
-                self._consec_rotations - self.spin_threshold
-            ) / self.reward_scale
-
-        # ── 6. Efficiency bonus at success ────────────────────────────────
-        if done and raw_reward >= 10.0:
-            efficiency = max(0.0, 1.0 - (self._step_count / self.max_steps))
-            r += self.efficiency_bonus * efficiency / self.reward_scale
-
-        # ── 7. Novelty bonus (find phase only) ────────────────────────────
-        if not enable_push:
-            pattern = tuple(sonar_bits.astype(int))
-            if pattern not in self._seen_patterns:
-                self._seen_patterns.add(pattern)
-                r += self.explore_scale / self.reward_scale
-        #Boundary penalty
-        if self._steps_at_boundary >= self.boundary_threshold and not enable_push:
-            extra = self.boundary_penalty * (
-                self._steps_at_boundary - self.boundary_threshold + 1
-            ) / self.reward_scale
-            r -= extra
-
-        
-
-        self._prev_push_state = enable_push
-        self._prev_obs        = obs.copy()
-        return r
 
 
 # ── Actor-Critic network ───────────────────────────────────────────────────────
@@ -507,6 +329,8 @@ def main():
     # ── Environment ───────────────────────────────────────────────────────
     ap.add_argument("--obelix_py",      type=str, required=True)
     ap.add_argument("--out",            type=str, default="weights.pth")
+    ap.add_argument("--load",           type=str, default=None,
+                    help="Path to weights to warm-start from (curriculum training)")
     ap.add_argument("--episodes",       type=int, default=3000)
     ap.add_argument("--max_steps",      type=int, default=1000)
     ap.add_argument("--difficulty",     type=int, default=0)
@@ -539,32 +363,15 @@ def main():
     ap.add_argument("--stack", type=int, default=8)
 
     # ── Reward shaping ─────────────────────────────────────────────────────
-    ap.add_argument("--reward_scale",    type=float, default=100.0)
-    ap.add_argument("--approach_scale",  type=float, default=0.3,
-                    help="Bonus per newly-active sonar bit during find phase")
-    ap.add_argument("--push_scale",      type=float, default=0.5,
-                    help="Bonus per non-stuck push step")
-    ap.add_argument("--stuck_penalty",   type=float, default=1.0,
-                    help="Extra penalty on top of env's -200/scale when stuck")
-    ap.add_argument("--explore_scale",   type=float, default=0.05,
-                    help="One-time novelty bonus for each new sonar bit-pattern seen")
-    ap.add_argument("--efficiency_bonus",type=float, default=5.0,
-                    help="One-time bonus at success, scaled by (1 - steps/max_steps). "
-                        "Set to 0 to disable.")
-    ap.add_argument("--forward_bonus",   type=float, default=0.1,
-                    help="Bonus per non-stuck FW action during find phase. "
-                        "Counteracts the spin-is-safe local minimum.")
-    ap.add_argument("--spin_penalty",    type=float, default=0.5,
-                    help="Penalty per step after spin_threshold consecutive rotations "
-                        "without a forward step (find phase only).")
-    ap.add_argument("--spin_threshold",  type=int,   default=8,
-                    help="How many consecutive rotation actions are allowed before "
-                        "spin_penalty kicks in. 8 ≈ one full 360° sweep.")
-    ap.add_argument("--no_shaping",      action="store_true",
-                    help="Disable all reward shaping (raw env reward only). "
-                        "Useful for ablation runs.")
-    ap.add_argument("--boundary_penalty",   type=float, default=3.0)
-    ap.add_argument("--boundary_threshold", type=int,   default=10)
+    ap.add_argument("--reward_scale",     type=float, default=20.0)
+    ap.add_argument("--approach_scale",   type=float, default=3.0)
+    ap.add_argument("--push_scale",       type=float, default=4.0)
+    ap.add_argument("--stuck_penalty",    type=float, default=2.0)
+    ap.add_argument("--spin_penalty",     type=float, default=2.0)
+    ap.add_argument("--spin_threshold",   type=int,   default=6)
+    ap.add_argument("--forward_bonus",    type=float, default=1.0)
+    ap.add_argument("--efficiency_bonus", type=float, default=10.0)
+    ap.add_argument("--no_shaping",       action="store_true")
     args = ap.parse_args()
 
     device = torch.device(args.device) if args.device else DEVICE
@@ -582,27 +389,33 @@ def main():
     ]
     vec = VecEnv(make_fns=make_fns, reward_shaping_fn=None)
 
-    stackers = [FrameStack(k=args.stack, obs_dim=18) for _ in range(args.n_envs)]
+    # BeliefStateEncoder handles both encoding and frame-stacking internally.
+    encoders = [BeliefStateEncoder(stack_k=args.stack) for _ in range(args.n_envs)]
     shapers = [
-    RewardShaper(
-        approach_scale   = args.approach_scale,
-        push_scale       = args.push_scale,
-        stuck_penalty    = args.stuck_penalty,
-        explore_scale    = args.explore_scale,
-        efficiency_bonus = args.efficiency_bonus,
-        forward_bonus    = args.forward_bonus,
-        spin_penalty     = args.spin_penalty,
-        spin_threshold   = args.spin_threshold,
-        max_steps        = args.max_steps,
-        reward_scale     = args.reward_scale,
-        boundary_penalty   = args.boundary_penalty,
-        boundary_threshold = args.boundary_threshold
-    )
+        RewardShaper(
+            reward_scale     = args.reward_scale,
+            approach_scale   = args.approach_scale,
+            push_scale       = args.push_scale,
+            stuck_penalty    = args.stuck_penalty,
+            spin_penalty     = args.spin_penalty,
+            spin_threshold   = args.spin_threshold,
+            forward_bonus    = args.forward_bonus,
+            efficiency_bonus = args.efficiency_bonus,
+            max_steps        = args.max_steps,
+        )
         for _ in range(args.n_envs)
     ]
 
-    obs_dim = stackers[0].stacked_dim
+    obs_dim = encoders[0].output_dim
     net     = ActorCritic(in_dim=obs_dim, hidden=args.hidden).to(device)
+
+    if args.load is not None:
+        sd = torch.load(args.load, map_location=device)
+        if isinstance(sd, dict) and "state_dict" in sd:
+            sd = sd["state_dict"]
+        net.load_state_dict(sd, strict=False)
+        print(f"[warm-start] Loaded weights from {args.load}")
+
     opt     = optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
 
     total_updates = max(
@@ -642,8 +455,10 @@ def main():
     init_seeds   = [args.seed + i for i in range(args.n_envs)]
     raw_obs_list = vec.reset(seeds=init_seeds)
 
+    for enc in encoders:
+        enc.reset()
     obs_arr = np.array(
-        [stackers[i].reset(raw_obs_list[i]) for i in range(args.n_envs)],
+        [encoders[i].encode(raw_obs_list[i]) for i in range(args.n_envs)],
         dtype=np.float32,
     )
     for sh in shapers:
@@ -691,18 +506,27 @@ def main():
             shaped_rewards = np.empty(args.n_envs, dtype=np.float32)
 
             for i in range(args.n_envs):
-                new_obs_arr[i] = stackers[i].step(raw_obs2_list[i])
+                # encode() updates internal state and returns stacked vector
+                new_obs_arr[i] = encoders[i].encode(raw_obs2_list[i], action_indices[i])
 
                 scaled = float(raw_rewards[i]) / args.reward_scale
+
+                # Use reward spike to latch push_active — IR bit is NOT sticky
+                # and can drop to 0 mid-push, so raw_obs2_list[i][16] is wrong.
+                if raw_rewards[i] >= 90.0:
+                    push_active[i] = True
+
                 if args.no_shaping:
                     shaped_rewards[i] = scaled
                 else:
-                    # Latch push_active on first IR contact (obs[16] == 1)
-                    if raw_obs2_list[i][16]:
-                        push_active[i] = True
+                    # encode_single() reads updated state for 38-dim shaper input
+                    enc_single = encoders[i].encode_single(raw_obs2_list[i], action_indices[i])
                     shaped_rewards[i] = shapers[i].shape(
-                        scaled, raw_obs2_list[i], bool(dones[i]), bool(push_active[i]),
-                        action=action_strs[i],    # pass the action string for this worker
+                        raw_reward=scaled,
+                        encoded_obs=enc_single,
+                        done=bool(dones[i]),
+                        enable_push=bool(push_active[i]),
+                        action=action_strs[i],
                     )
 
             buf.add_batch(
@@ -723,7 +547,7 @@ def main():
                 if not dones[i]:
                     continue
 
-                if raw_rewards[i] >= 1000:
+                if raw_rewards[i] >= 100.0:
                     success_count += 1
 
                 window_returns.append(float(ep_ret[i]))
@@ -742,14 +566,14 @@ def main():
                 })
                 pbar.update(1)
 
-                new_seed       = args.seed + args.n_envs + episodes_done
-                raw_reset_obs  = vec.reset_one(i, seed=new_seed)
-                new_obs_arr[i] = stackers[i].reset(raw_reset_obs)
+                new_seed = args.seed + args.n_envs + episodes_done
+                raw_reset_obs = vec.reset_one(i, seed=new_seed)
+                encoders[i].reset()
+                new_obs_arr[i] = encoders[i].encode(raw_reset_obs)
                 shapers[i].reset()
 
                 ep_ret[i]      = 0.0
                 ep_steps[i]    = 0
-                last_done[i]   = False
                 push_active[i] = False
 
             obs_arr = new_obs_arr

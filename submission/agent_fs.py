@@ -1,9 +1,27 @@
+"""Submission agent — PPO + BeliefStateEncoder with frame stacking.
+
+The evaluator imports this file and calls policy(obs, rng) once per step.
+Action space (strings): 'L45', 'L22', 'FW', 'R22', 'R45'
+Observation: numpy array shape (18,), values 0/1.
+
+Architecture (mirrors train_ppo_frame_stacking.py):
+  - BeliefStateEncoder(stack_k) : 18-dim obs -> (stack_k * 33 + 5)-dim
+  - ActorCritic: trunk = Linear(in, h)+Tanh -> Linear(h,h)+Tanh
+                 actor = Linear(h, 5)
+  - Inference  : deterministic argmax over actor logits
+
+stack_k and hidden are inferred from checkpoint weight shapes.
+
+Episode boundary:
+  Codabench calls policy() for ALL episodes without calling reset().
+  We auto-reset the encoder after _MAX_EPISODE_STEPS steps.
+"""
 
 from __future__ import annotations
 
 import collections
 import os
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -12,6 +30,7 @@ import torch.nn as nn
 # ── Constants ─────────────────────────────────────────────────────────────────
 ACTIONS:            Sequence[str] = ("L45", "L22", "FW", "R22", "R45")
 _N_ACTIONS:         int           = len(ACTIONS)
+_OBS_DIM:           int           = 18
 _CORE_DIM:          int           = 33   # BeliefStateEncoder._CORE_DIM
 _MAX_EPISODE_STEPS: int           = 1000
 
@@ -74,111 +93,92 @@ class _BeliefStateEncoder:
         return np.concatenate([*self._frames, prev_act_oh])
 
 
-# Actor Critic LSTM Network
-class _ActorCriticLSTM(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+# ── Network (mirrors ActorCritic in train_ppo_frame_stacking.py) ──────────────
+class _ActorCritic(nn.Module):
+    def __init__(self, in_dim: int, hidden: int):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.Tanh(),
-            nn.Linear(128, 64),        nn.Tanh(),
+        self.trunk = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
         )
-        self.lstm   = nn.LSTM(input_size=64, hidden_size=hidden_dim,
-                              num_layers=1, batch_first=True)
-        self.actor  = nn.Linear(hidden_dim, _N_ACTIONS)
-        self.critic = nn.Linear(hidden_dim, 1)
+        self.actor  = nn.Linear(hidden, _N_ACTIONS)
+        self.critic = nn.Linear(hidden, 1)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        hidden: Tuple[torch.Tensor, torch.Tensor],
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        enc = self.encoder(x).unsqueeze(1)          # (1, 1, 64)
-        out, new_hidden = self.lstm(enc, hidden)     # (1, 1, H)
-        logits = self.actor(out.squeeze(1))          # (1, N_ACTIONS)
-        return logits, new_hidden
+    def forward(self, x: torch.Tensor):
+        return self.actor(self.trunk(x)), self.critic(self.trunk(x)).squeeze(-1)
 
 
 # ── Module-level persistent state ─────────────────────────────────────────────
-_model:           Optional[_ActorCriticLSTM]    = None
+_model:           Optional[_ActorCritic]      = None
 _encoder:         Optional[_BeliefStateEncoder] = None
-_hidden_dim:      int                           = 0
-_h:               Optional[torch.Tensor]        = None
-_c:               Optional[torch.Tensor]        = None
-_step_count:      int                           = 0
-_prev_action_idx: int                           = 2   # default FW
+_step_count:      int                         = 0
+_prev_action_idx: int                         = 2   # default FW
 
 
 def reset() -> None:
-    global _h, _c, _step_count, _prev_action_idx
+    global _step_count, _prev_action_idx
     if _encoder is not None:
         _encoder.reset()
-    if _model is not None:
-        _h = torch.zeros(1, 1, _hidden_dim)
-        _c = torch.zeros(1, 1, _hidden_dim)
     _step_count      = 0
     _prev_action_idx = 2
 
 
 # ── Weight loader ─────────────────────────────────────────────────────────────
 def _load_once() -> None:
-    global _model, _encoder, _hidden_dim, _h, _c
+    global _model, _encoder
 
     if _model is not None:
         return
 
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("weights_ppo_lstm.pth", "weights.pth"):
+    for name in ("weights_ppo_fs.pth", "weights_ppo.pth", "weights.pth"):
         p = os.path.join(here, name)
         if os.path.exists(p):
             wpath = p
             break
     else:
         raise FileNotFoundError(
-            "No weights file found next to agent.py. "
-            "Expected 'weights_ppo_lstm.pth' or 'weights.pth'."
+            "No weights file found next to agent_fs.py. "
+            "Expected 'weights_ppo_fs.pth', 'weights_ppo.pth', or 'weights.pth'."
         )
 
     sd = torch.load(wpath, map_location="cpu")
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
 
-    # encoder.0.weight shape = (128, input_dim) where input_dim = stack_k*33 + 5
-    input_dim  = sd["encoder.0.weight"].shape[1]
-    hidden_dim = sd["lstm.weight_ih_l0"].shape[0] // 4
+    # trunk.0.weight shape = (hidden, in_dim) where in_dim = stack_k*33 + 5
+    w0     = sd["trunk.0.weight"]
+    hidden = w0.shape[0]
+    in_dim = w0.shape[1]
 
-    if (input_dim - _N_ACTIONS) % _CORE_DIM != 0:
+    if (in_dim - _N_ACTIONS) % _CORE_DIM != 0:
         raise ValueError(
-            f"Checkpoint input_dim={input_dim} inconsistent with CORE_DIM={_CORE_DIM}."
+            f"Checkpoint in_dim={in_dim} inconsistent with CORE_DIM={_CORE_DIM}."
         )
-    stack_k = (input_dim - _N_ACTIONS) // _CORE_DIM
+    stack_k = (in_dim - _N_ACTIONS) // _CORE_DIM
 
-    model = _ActorCriticLSTM(input_dim=input_dim, hidden_dim=hidden_dim)
+    model = _ActorCritic(in_dim=in_dim, hidden=hidden)
     model.load_state_dict(sd, strict=True)
     model.eval()
 
-    _model      = model
-    _encoder    = _BeliefStateEncoder(stack_k=stack_k)
-    _hidden_dim = hidden_dim
-    _h          = torch.zeros(1, 1, hidden_dim)
-    _c          = torch.zeros(1, 1, hidden_dim)
+    _model   = model
+    _encoder = _BeliefStateEncoder(stack_k=stack_k)
 
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
-    global _h, _c, _step_count, _prev_action_idx
+    global _step_count, _prev_action_idx
 
     _load_once()
 
     if _step_count >= _MAX_EPISODE_STEPS:
         reset()
 
-    feat = _encoder.encode(obs, _prev_action_idx)
-    x    = torch.tensor(feat, dtype=torch.float32).unsqueeze(0)
-
-    logits, (_h, _c) = _model(x, (_h, _c))
-    action_idx       = int(logits.squeeze(0).argmax().item())
+    feat       = _encoder.encode(obs, _prev_action_idx)
+    x          = torch.tensor(feat, dtype=torch.float32).unsqueeze(0)
+    logits, _  = _model(x)
+    action_idx = int(logits.squeeze(0).argmax().item())
 
     _step_count      += 1
     _prev_action_idx  = action_idx

@@ -1,27 +1,18 @@
-"""Submission agent — PPO + LSTM.
+"""Submission agent — PPO + LSTM with BeliefStateEncoder.
 
 The evaluator imports this file and calls policy(obs, rng) once per step.
 Action space (strings): 'L45', 'L22', 'FW', 'R22', 'R45'
 Observation: numpy array shape (18,), values 0/1.
 
-Architecture (mirrors train_ppo_lstm.py exactly):
-  - Encoder : Linear(18, 64) + Tanh
-  - LSTM    : input=64, hidden=h (inferred from checkpoint)
-  - Actor   : Linear(h, 5)       (critic loaded but unused at inference)
-  - Inference: deterministic — argmax over actor logits
+Architecture (mirrors train_ppo_lstm.py):
+  - BeliefStateEncoder : 18-dim obs  ->  38-dim encoded feature
+  - ActorCriticLSTM    : encoder(38 -> 128 -> 64) + LSTM(64, H) + actor/critic
+  - Inference          : deterministic argmax over actor logits
 
-Hidden size h is inferred from checkpoint weight shapes so this file
-never needs editing after retraining with a different --hidden value.
-
-Episode boundary handling:
-  The Codabench evaluator imports this module ONCE and calls policy_fn for
-  ALL episodes without calling reset() between them.  The LSTM hidden state
-  (h, c) would carry stale context across episode boundaries.
-  Fix: a step counter auto-resets h, c, and the push latch after
-  _MAX_EPISODE_STEPS steps, matching the evaluator's max_steps=1000.
-  For episodes that end early (success), the first few steps of the next
-  episode start with a slightly stale hidden state, but this is minor.
-  Harnesses that do call reset() get perfectly clean episode starts.
+Episode boundary:
+  Codabench calls policy() for ALL episodes without calling reset() between
+  them. We auto-reset LSTM hidden state and encoder after _MAX_EPISODE_STEPS.
+  Harnesses that call reset() explicitly get perfectly clean episode starts.
 """
 
 from __future__ import annotations
@@ -33,158 +24,172 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# ── Fixed constants ────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 ACTIONS:            Sequence[str] = ("L45", "L22", "FW", "R22", "R45")
-_OBS_DIM:           int           = 18    # raw obs length — always 18 for OBELIX
-_ENC_DIM:           int           = 64    # encoder output size (hardcoded in trainer)
 _N_ACTIONS:         int           = len(ACTIONS)
-_MAX_EPISODE_STEPS: int           = 1000  # matches evaluator's max_steps
+_MAX_EPISODE_STEPS: int           = 1000
+
+
+# ── BeliefStateEncoder (must mirror state_encoder.py) ─────────────────────────
+class _BeliefStateEncoder:
+    """Inline copy of BeliefStateEncoder so the agent file is self-contained."""
+
+    def __init__(self, max_steps_since_seen: int = 30, max_stuck_steps: int = 20):
+        self.max_steps_since_seen = max_steps_since_seen
+        self.max_stuck_steps      = max_stuck_steps
+        self.reset()
+
+    def reset(self) -> None:
+        self._prev_ir          = 0.0
+        self._prev_stuck       = 0.0
+        self._steps_since_seen = self.max_steps_since_seen
+        self._stuck_steps      = 0
+
+    def encode(self, obs: np.ndarray, prev_action_idx: Optional[int] = None) -> np.ndarray:
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+
+        far   = obs[0:16:2]
+        near  = obs[1:16:2]
+        ir    = float(obs[16])
+        stuck = float(obs[17])
+
+        strengths   = 2.0 * near + far
+        left        = float(strengths[0] + strengths[1])
+        front       = float(strengths[2] + strengths[3] + strengths[4] + strengths[5])
+        right       = float(strengths[6] + strengths[7])
+        dir_summary = np.array([left, front, right], dtype=np.float32)
+
+        if float(np.sum(strengths)) > 0 or ir > 0:
+            self._steps_since_seen = 0
+        else:
+            self._steps_since_seen = min(
+                self._steps_since_seen + 1, self.max_steps_since_seen
+            )
+
+        if stuck > 0:
+            self._stuck_steps = min(self._stuck_steps + 1, self.max_stuck_steps)
+        else:
+            self._stuck_steps = 0
+
+        just_got_ir    = 1.0 if (self._prev_ir == 0.0 and ir == 1.0) else 0.0
+        just_recovered = 1.0 if (self._prev_stuck == 1.0 and stuck == 0.0) else 0.0
+
+        temporal = np.array([
+            self._steps_since_seen / self.max_steps_since_seen,
+            self._stuck_steps      / self.max_stuck_steps,
+            just_got_ir,
+            just_recovered,
+        ], dtype=np.float32)
+
+        prev_act_oh = np.zeros(_N_ACTIONS, dtype=np.float32)
+        if prev_action_idx is not None:
+            prev_act_oh[prev_action_idx] = 1.0
+
+        self._prev_ir    = ir
+        self._prev_stuck = stuck
+
+        return np.concatenate([obs, strengths, dir_summary, temporal, prev_act_oh])
 
 
 # ── Network (must mirror ActorCriticLSTM in train_ppo_lstm.py) ────────────────
-class ActorCriticLSTM(nn.Module):
-    """Encoder → LSTM → Actor / Critic.
-
-    The critic head is included so load_state_dict(strict=True) succeeds
-    without manually filtering checkpoint keys.
-    """
-
-    def __init__(self, hidden_dim: int, n_actions: int = _N_ACTIONS):
+class _ActorCriticLSTM(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.hidden_dim = hidden_dim
-
         self.encoder = nn.Sequential(
-            nn.Linear(_OBS_DIM, _ENC_DIM),
-            nn.Tanh(),
+            nn.Linear(input_dim, 128), nn.Tanh(),
+            nn.Linear(128, 64),        nn.Tanh(),
         )
-
-        self.lstm = nn.LSTM(
-            input_size=_ENC_DIM,
-            hidden_size=hidden_dim,
-            num_layers=1,
-            batch_first=True,
-        )
-
-        self.actor  = nn.Linear(hidden_dim, n_actions)
+        self.lstm   = nn.LSTM(input_size=64, hidden_size=hidden_dim,
+                              num_layers=1, batch_first=True)
+        self.actor  = nn.Linear(hidden_dim, _N_ACTIONS)
         self.critic = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
-        obs:    torch.Tensor,                       # (1, 18) — single step
-        hidden: Tuple[torch.Tensor, torch.Tensor],  # ((1,1,H), (1,1,H))
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
-        enc = self.encoder(obs).unsqueeze(1)        # (1, 1, 64)
-        out, new_hidden = self.lstm(enc, hidden)    # out: (1, 1, H)
-        out = out.squeeze(1)                        # (1, H)
-        return self.actor(out), self.critic(out).squeeze(-1), new_hidden
+        x: torch.Tensor,
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        enc = self.encoder(x).unsqueeze(1)
+        out, new_hidden = self.lstm(enc, hidden)
+        logits = self.actor(out.squeeze(1))
+        return logits, new_hidden
 
 
 # ── Module-level persistent state ─────────────────────────────────────────────
-_model:       Optional[ActorCriticLSTM]          = None
-_hidden_dim:  int                                = 0
-_h:           Optional[torch.Tensor]             = None   # (1, 1, H)
-_c:           Optional[torch.Tensor]             = None   # (1, 1, H)
-_push_active: bool                               = False  # sticky IR-contact latch
-_step_count:  int                                = 0      # steps since last reset
+_model:           Optional[_ActorCriticLSTM] = None
+_hidden_dim:      int                        = 0
+_h:               Optional[torch.Tensor]     = None
+_c:               Optional[torch.Tensor]     = None
+_encoder:         _BeliefStateEncoder        = _BeliefStateEncoder()
+_step_count:      int                        = 0
+_prev_action_idx: int                        = 2   # default FW
 
 
 def reset() -> None:
-    """Reset episode state. Call at the start of each new episode.
-
-    Zeroes the LSTM hidden state and push latch so episode N's memory does
-    not bleed into episode N+1.  If the evaluator does not call this,
-    policy() auto-resets via _step_count after _MAX_EPISODE_STEPS steps.
-    """
-    global _push_active, _step_count, _h, _c
+    """Reset episode state. Call at the start of each new episode."""
+    global _h, _c, _step_count, _prev_action_idx
     if _model is not None:
         _h = torch.zeros(1, 1, _hidden_dim)
         _c = torch.zeros(1, 1, _hidden_dim)
-    _push_active = False
-    _step_count  = 0
+    _encoder.reset()
+    _step_count      = 0
+    _prev_action_idx = 2
 
 
-# ── Weight loader ──────────────────────────────────────────────────────────────
+# ── Weight loader ─────────────────────────────────────────────────────────────
 def _load_once() -> None:
-    """Load checkpoint and build model with hidden_dim inferred from weights.
-
-    hidden_dim is inferred from lstm.weight_ih_l0, which has shape
-    (4 * hidden_dim, enc_dim) — the factor of 4 comes from the four LSTM
-    gates (input, forget, cell, output) concatenated along dim 0.
-    This makes the agent work with any --hidden value without code changes.
-    """
     global _model, _hidden_dim, _h, _c
 
     if _model is not None:
         return
 
-    here  = os.path.dirname(os.path.abspath(__file__))
-    wpath = os.path.join(here, "weights_ppo_lstm.pth")
-    if not os.path.exists(wpath):
-        wpath_fallback = os.path.join(here, "weights.pth")
-        if os.path.exists(wpath_fallback):
-            wpath = wpath_fallback
-        else:
-            raise FileNotFoundError(
-                "Neither 'weights_ppo_lstm.pth' nor 'weights.pth' found next to agent.py. "
-                "Train with train_ppo_lstm.py and place the weights file in the same directory."
-            )
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("weights_ppo_lstm.pth", "weights.pth"):
+        p = os.path.join(here, name)
+        if os.path.exists(p):
+            wpath = p
+            break
+    else:
+        raise FileNotFoundError(
+            "No weights file found next to agent.py. "
+            "Expected 'weights_ppo_lstm.pth' or 'weights.pth'."
+        )
 
     sd = torch.load(wpath, map_location="cpu")
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
 
-    # lstm.weight_ih_l0 shape: (4 * hidden_dim, enc_dim)
-    # Divide axis-0 by 4 to recover hidden_dim.
-    ih = sd["lstm.weight_ih_l0"]     # shape: (4*H, enc_dim)
-    if ih.shape[0] % 4 != 0:
-        raise ValueError(
-            f"lstm.weight_ih_l0 has {ih.shape[0]} rows, expected a multiple of 4. "
-            "Checkpoint may be from a different architecture."
-        )
-    hidden_dim = ih.shape[0] // 4
+    input_dim  = sd["encoder.0.weight"].shape[1]
+    hidden_dim = sd["lstm.weight_ih_l0"].shape[0] // 4
 
-    m = ActorCriticLSTM(hidden_dim=hidden_dim)
-    m.load_state_dict(sd, strict=True)
-    m.eval()
+    model = _ActorCriticLSTM(input_dim=input_dim, hidden_dim=hidden_dim)
+    model.load_state_dict(sd, strict=True)
+    model.eval()
 
-    _model      = m
+    _model      = model
     _hidden_dim = hidden_dim
     _h          = torch.zeros(1, 1, hidden_dim)
     _c          = torch.zeros(1, 1, hidden_dim)
 
 
-# ── Policy ─────────────────────────────────────────────────────────────────────
+# ── Policy ────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
-    """Return a deterministic action for the given 18-dim observation.
+    global _h, _c, _step_count, _prev_action_idx
 
-    The LSTM hidden state (h, c) is carried across calls so the network has
-    temporal context over the episode, matching training behaviour.
+    _load_once()
 
-    Episode auto-reset: after _MAX_EPISODE_STEPS steps, h and c are zeroed
-    and the push latch is cleared — handling the Codabench evaluator which
-    does not call reset() between episodes.
-    """
-    global _push_active, _step_count, _h, _c
-
-    _load_once()   # no-op after the first call
-
-    # ── Auto-reset at episode boundary ────────────────────────────────────────
     if _step_count >= _MAX_EPISODE_STEPS:
-        _h           = torch.zeros(1, 1, _hidden_dim)
-        _c           = torch.zeros(1, 1, _hidden_dim)
-        _push_active = False
-        _step_count  = 0
+        reset()
 
-    # ── Single-step LSTM forward ──────────────────────────────────────────────
-    x              = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # (1, 18)
-    logits, _, (_h, _c) = _model(x, (_h, _c))                            # logits: (1, 5)
-    _step_count   += 1
+    feat = _encoder.encode(obs, _prev_action_idx)
+    x    = torch.tensor(feat, dtype=torch.float32).unsqueeze(0)
 
-    # ── Sticky push latch (mirrors env.enable_push) ───────────────────────────
-    if obs[16]:
-        _push_active = True
+    logits, (_h, _c) = _model(x, (_h, _c))
+    action_idx       = int(logits.squeeze(0).argmax().item())
 
-    # ── Deterministic inference ───────────────────────────────────────────────
-    action_idx = int(logits.squeeze(0).argmax().item())
+    _step_count      += 1
+    _prev_action_idx  = action_idx
+
     return ACTIONS[action_idx]
