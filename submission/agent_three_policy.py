@@ -1,9 +1,7 @@
-"""Inference agent for three-policy OBELIX PPO.
+"""Inference agent for bundled three-policy OBELIX PPO.
 
-Expected files next to this agent:
-    weights_find.pth
-    weights_push.pth
-    weights_unwedge.pth
+Expected file next to this agent:
+    weights.pth
 """
 
 from __future__ import annotations
@@ -136,39 +134,36 @@ def _load_once() -> None:
         return
 
     here = os.path.dirname(os.path.abspath(__file__))
-    paths = {
-        behavior: os.path.join(here, f"weights_{behavior}.pth")
-        for behavior in BEHAVIORS
-    }
-    missing = [behavior for behavior, path in paths.items() if not os.path.exists(path)]
-    if missing:
+    weight_path = os.path.join(here, "weights.pth")
+    if not os.path.exists(weight_path):
         raise FileNotFoundError(
-            f"Missing three-policy checkpoints for: {missing}. "
-            f"Expected them next to {os.path.basename(__file__)}."
+            "Missing bundled checkpoint 'weights.pth' next to agent_three_policy.py."
         )
 
-    state_dicts = {
-        behavior: torch.load(path, map_location="cpu")
-        for behavior, path in paths.items()
-    }
+    bundle = torch.load(weight_path, map_location="cpu")
+    meta = bundle.get("meta", {})
 
-    input_dim = state_dicts[_FIND]["trunk.0.weight"].shape[1]
-    hidden_dim = state_dicts[_FIND]["trunk.0.weight"].shape[0]
-    stack_k = (input_dim - _N_ACTIONS) // _CORE_DIM
+    for behavior in BEHAVIORS:
+        if behavior not in bundle:
+            raise KeyError(f"Bundled checkpoint is missing '{behavior}' weights.")
+
+    input_dim = bundle[_FIND]["trunk.0.weight"].shape[1]
+    hidden_dim = int(meta.get("hidden", bundle[_FIND]["trunk.0.weight"].shape[0]))
+    stack_k = int(meta.get("stack", (input_dim - _N_ACTIONS) // _CORE_DIM))
 
     _models = {}
     for behavior in BEHAVIORS:
         model = _ActorCritic(input_dim=input_dim, hidden_dim=hidden_dim)
-        model.load_state_dict(state_dicts[behavior], strict=True)
+        model.load_state_dict(bundle[behavior], strict=True)
         model.eval()
         _models[behavior] = model
 
     _encoder = _BeliefStateEncoder(stack_k=stack_k)
     _manager = BehaviorManager(
         BehaviorManagerConfig(
-            push_linger_steps=5,
-            unwedge_linger_steps=5,
-            attach_reward_threshold=90.0,
+            push_linger_steps=int(meta.get("push_linger_steps", 5)),
+            unwedge_linger_steps=int(meta.get("unwedge_linger_steps", 5)),
+            attach_reward_threshold=float(meta.get("attach_reward_threshold", 90.0)),
             sticky_push=True,
             activate_push_on_ir=True,
         )

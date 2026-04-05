@@ -1,9 +1,9 @@
 """Inference agent for three-policy OBELIX PPO.
 
 Expected files next to this agent:
-    weights_find.pth
-    weights_push.pth
-    weights_unwedge.pth
+    three_policy_weights/weights_find.pth
+    three_policy_weights/weights_push.pth
+    three_policy_weights/weights_unwedge.pth
 """
 
 from __future__ import annotations
@@ -136,15 +136,17 @@ def _load_once() -> None:
         return
 
     here = os.path.dirname(os.path.abspath(__file__))
+    weights_dir = os.path.join(here, "three_policy_weights")
+
     paths = {
-        behavior: os.path.join(here, f"weights_{behavior}.pth")
+        behavior: os.path.join(weights_dir, f"weights_{behavior}.pth")
         for behavior in BEHAVIORS
     }
     missing = [behavior for behavior, path in paths.items() if not os.path.exists(path)]
     if missing:
         raise FileNotFoundError(
             f"Missing three-policy checkpoints for: {missing}. "
-            f"Expected them next to {os.path.basename(__file__)}."
+            f"Expected them under {weights_dir}."
         )
 
     state_dicts = {
