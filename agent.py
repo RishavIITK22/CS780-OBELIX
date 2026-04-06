@@ -5,7 +5,7 @@ Action space (strings): 'L45', 'L22', 'FW', 'R22', 'R45'
 Observation: numpy array shape (18,), values 0/1.
 
 Architecture (mirrors train_ppo_lstm.py):
-  - BeliefStateEncoder(stack_k) : 18-dim obs -> (stack_k * 33 + 5)-dim
+  - BeliefStateEncoder(stack_k) : 18-dim obs -> (stack_k * 49 + 5)-dim
   - ActorCriticLSTM: encoder(in_dim -> 128 -> 64) + LSTM(64, H) + actor/critic
   - Inference: deterministic argmax over actor logits
 
@@ -30,27 +30,41 @@ import torch.nn as nn
 # ── Constants ─────────────────────────────────────────────────────────────────
 ACTIONS:            Sequence[str] = ("L45", "L22", "FW", "R22", "R45")
 _N_ACTIONS:         int           = len(ACTIONS)
-_CORE_DIM:          int           = 33   # BeliefStateEncoder._CORE_DIM
+_CORE_DIM:          int           = 49   # BeliefStateEncoder.CORE_DIM
 _MAX_EPISODE_STEPS: int           = 1000
 
 
 # ── BeliefStateEncoder (inline, mirrors state_encoder.py) ─────────────────────
 class _BeliefStateEncoder:
-    def __init__(self, stack_k: int = 4, max_steps_since_seen: int = 30,
-                 max_stuck_steps: int = 20):
-        self.stack_k              = stack_k
+    def __init__(
+        self,
+        stack_k: int = 4,
+        max_steps_since_seen: int = 30,
+        max_stuck_steps: int = 20,
+        max_seen_streak: int = 30,
+        max_lost_streak: int = 30,
+    ):
+        self.stack_k = stack_k
         self.max_steps_since_seen = max_steps_since_seen
-        self.max_stuck_steps      = max_stuck_steps
-        self.output_dim           = stack_k * _CORE_DIM + _N_ACTIONS
+        self.max_stuck_steps = max_stuck_steps
+        self.max_seen_streak = max_seen_streak
+        self.max_lost_streak = max_lost_streak
+        self.output_dim = stack_k * _CORE_DIM + _N_ACTIONS
         self.reset()
 
     def reset(self) -> None:
-        self._prev_ir          = 0.0
-        self._prev_stuck       = 0.0
+        self._prev_ir = 0.0
+        self._prev_stuck = 0.0
+        self._prev_visible = 0.0
         self._steps_since_seen = self.max_steps_since_seen
-        self._stuck_steps      = 0
+        self._stuck_steps = 0
+        self._seen_streak = 0
+        self._lost_streak = 0
+        self._prev_dir_summary = np.zeros(3, dtype=np.float32)
+        self._prev_total_strength = 0.0
+        self._prev_lr_balance = 0.0
         self._frames: collections.deque = collections.deque(
-            [np.zeros(_CORE_DIM, dtype=np.float32)] * self.stack_k,
+            [np.zeros(_CORE_DIM, dtype=np.float32) for _ in range(self.stack_k)],
             maxlen=self.stack_k,
         )
 
@@ -60,10 +74,17 @@ class _BeliefStateEncoder:
         ir, stuck = float(obs[16]), float(obs[17])
         strengths = 2.0 * near + far
 
-        if float(np.sum(strengths)) > 0 or ir > 0:
+        total_strength = float(np.sum(strengths))
+        visible = 1.0 if (total_strength > 0.0 or ir > 0.0) else 0.0
+
+        if visible > 0.0:
             self._steps_since_seen = 0
+            self._seen_streak = min(self._seen_streak + 1, self.max_seen_streak)
+            self._lost_streak = 0
         else:
             self._steps_since_seen = min(self._steps_since_seen + 1, self.max_steps_since_seen)
+            self._lost_streak = min(self._lost_streak + 1, self.max_lost_streak)
+            self._seen_streak = 0
         if stuck > 0:
             self._stuck_steps = min(self._stuck_steps + 1, self.max_stuck_steps)
         else:
@@ -74,20 +95,64 @@ class _BeliefStateEncoder:
             float(strengths[2] + strengths[3] + strengths[4] + strengths[5]),
             float(strengths[6] + strengths[7]),
         ], dtype=np.float32)
+        near_count = float(np.sum(near))
+        far_count = float(np.sum(far))
+        strongest_strength = float(np.max(strengths)) if strengths.size else 0.0
+        sector_mass = np.sum(strengths)
+        if sector_mass > 0:
+            sector_positions = np.linspace(-1.0, 1.0, num=8, dtype=np.float32)
+            sector_centroid = float(np.dot(strengths, sector_positions) / sector_mass)
+        else:
+            sector_centroid = 0.0
+
+        left, front, right = float(dir_summary[0]), float(dir_summary[1]), float(dir_summary[2])
+        front_ratio = front / max(total_strength, 1.0)
+        left_ratio = left / max(total_strength, 1.0)
+        right_ratio = right / max(total_strength, 1.0)
+        lr_balance = (right - left) / max(total_strength, 1.0)
+        just_lost_ir = 1.0 if (self._prev_ir == 1.0 and ir == 0.0) else 0.0
+
+        geometry = np.array([
+            total_strength / 24.0,
+            near_count / 8.0,
+            far_count / 8.0,
+            strongest_strength / 3.0,
+            sector_centroid,
+            front_ratio,
+            left_ratio,
+            right_ratio,
+        ], dtype=np.float32)
+
         temporal = np.array([
             self._steps_since_seen / self.max_steps_since_seen,
-            self._stuck_steps      / self.max_stuck_steps,
+            self._seen_streak / self.max_seen_streak,
+            self._lost_streak / self.max_lost_streak,
+            self._stuck_steps / self.max_stuck_steps,
+            visible,
             1.0 if (self._prev_ir == 0.0 and ir == 1.0) else 0.0,
+            just_lost_ir,
             1.0 if (self._prev_stuck == 1.0 and stuck == 0.0) else 0.0,
         ], dtype=np.float32)
 
-        self._prev_ir, self._prev_stuck = ir, stuck
+        transition = np.array([
+            (total_strength - self._prev_total_strength) / 24.0,
+            (front - float(self._prev_dir_summary[1])) / 12.0,
+            lr_balance - self._prev_lr_balance,
+            visible - self._prev_visible,
+        ], dtype=np.float32)
+
+        self._prev_ir = ir
+        self._prev_stuck = stuck
+        self._prev_visible = visible
+        self._prev_dir_summary = dir_summary.copy()
+        self._prev_total_strength = total_strength
+        self._prev_lr_balance = lr_balance
 
         prev_act_oh = np.zeros(_N_ACTIONS, dtype=np.float32)
         if prev_action_idx is not None:
             prev_act_oh[prev_action_idx] = 1.0
 
-        core = np.concatenate([obs, strengths, dir_summary, temporal])
+        core = np.concatenate([obs, strengths, dir_summary, geometry, temporal, transition])
         self._frames.append(core)
         return np.concatenate([*self._frames, prev_act_oh])
 
@@ -161,7 +226,7 @@ def _load_once() -> None:
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
 
-    # encoder.0.weight shape = (128, input_dim) where input_dim = stack_k*33 + 5
+    # encoder.0.weight shape = (128, input_dim) where input_dim = stack_k*49 + 5
     input_dim  = sd["encoder.0.weight"].shape[1]
     hidden_dim = sd["lstm.weight_ih_l0"].shape[0] // 4
 

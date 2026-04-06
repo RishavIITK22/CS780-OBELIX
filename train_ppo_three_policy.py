@@ -1,4 +1,4 @@
-"""Three-policy PPO trainer for OBELIX using frame stacking.
+"""Three-policy PPO trainer for OBELIX using frame stacking or raw observations.
 
 Implements the paper-style behavior decomposition:
     unwedge > push > find
@@ -6,7 +6,7 @@ Implements the paper-style behavior decomposition:
 Each behavior owns a separate PPO policy and value head. A fixed behavior
 manager decides which policy acts at each step. Training uses:
     - VecEnv from vec_env.py
-    - BeliefStateEncoder from state_encoder.py
+    - optional BeliefStateEncoder from state_encoder.py
     - raw environment rewards with simple scaling only
 
 This file does not modify any existing training scripts.
@@ -286,7 +286,7 @@ def save_checkpoint_bundle(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Three-policy PPO trainer for OBELIX using frame stacking"
+        description="Three-policy PPO trainer for OBELIX using frame stacking or raw observations"
     )
     ap.add_argument("--obelix_py", type=str, required=True)
     ap.add_argument("--out_dir", type=str, default="three_policy_weights")
@@ -313,6 +313,11 @@ def main():
     ap.add_argument("--max_grad", type=float, default=0.5)
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--stack", type=int, default=8)
+    ap.add_argument(
+        "--no_state_encoder",
+        action="store_true",
+        help="Use raw 18-d observations instead of the handcrafted belief-state encoder.",
+    )
 
     ap.add_argument("--reward_scale", type=float, default=20.0)
     ap.add_argument("--min_samples_per_behavior", type=int, default=100)
@@ -336,16 +341,22 @@ def main():
     ]
     vec = VecEnv(make_fns=make_fns, reward_shaping_fn=None)
 
-    encoders = [BeliefStateEncoder(stack_k=args.stack) for _ in range(args.n_envs)]
+    use_state_encoder = not args.no_state_encoder
+    encoders = (
+        [BeliefStateEncoder(stack_k=args.stack) for _ in range(args.n_envs)]
+        if use_state_encoder
+        else []
+    )
     manager_cfg = BehaviorManagerConfig(
         push_linger_steps=args.push_linger_steps,
         unwedge_linger_steps=args.unwedge_linger_steps,
         attach_reward_threshold=args.attach_reward_threshold,
         sticky_push=True,
+        activate_push_on_ir=True,
     )
     managers = [BehaviorManager(manager_cfg) for _ in range(args.n_envs)]
 
-    obs_dim = encoders[0].output_dim
+    obs_dim = encoders[0].output_dim if use_state_encoder else 18
     nets = {
         behavior: ActorCritic(in_dim=obs_dim, hidden=args.hidden).to(device)
         for behavior in BEHAVIORS
@@ -369,12 +380,16 @@ def main():
     init_seeds = [args.seed + i for i in range(args.n_envs)]
     raw_obs_list = vec.reset(seeds=init_seeds)
     for i in range(args.n_envs):
-        encoders[i].reset()
         managers[i].reset(raw_obs_list[i])
-    obs_arr = np.asarray(
-        [encoders[i].encode(raw_obs_list[i]) for i in range(args.n_envs)],
-        dtype=np.float32,
-    )
+        if use_state_encoder:
+            encoders[i].reset()
+    if use_state_encoder:
+        obs_arr = np.asarray(
+            [encoders[i].encode(raw_obs_list[i]) for i in range(args.n_envs)],
+            dtype=np.float32,
+        )
+    else:
+        obs_arr = np.asarray(raw_obs_list, dtype=np.float32)
 
     ep_ret = np.zeros(args.n_envs, dtype=np.float32)
     ep_steps = np.zeros(args.n_envs, dtype=np.int32)
@@ -400,7 +415,8 @@ def main():
     )
     print(
         f"[Three-Policy PPO] policies={', '.join(BEHAVIORS)} "
-        f"difficulty={args.difficulty} wall={args.wall_obstacles}\n"
+        f"difficulty={args.difficulty} wall={args.wall_obstacles} "
+        f"repr={'state-encoder' if use_state_encoder else 'raw'}\n"
     )
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=120)
@@ -441,9 +457,12 @@ def main():
             raw_rewards = np.asarray([r[1] for r in results], dtype=np.float32)
             dones = np.asarray([r[2] for r in results], dtype=bool)
 
-            next_obs_arr = np.empty_like(obs_arr)
-            for i in range(args.n_envs):
-                next_obs_arr[i] = encoders[i].encode(next_raw_obs_list[i], action_indices[i])
+            if use_state_encoder:
+                next_obs_arr = np.empty_like(obs_arr)
+                for i in range(args.n_envs):
+                    next_obs_arr[i] = encoders[i].encode(next_raw_obs_list[i], action_indices[i])
+            else:
+                next_obs_arr = np.asarray(next_raw_obs_list, dtype=np.float32)
 
             scaled_rewards = raw_rewards / args.reward_scale
 
@@ -486,9 +505,12 @@ def main():
                     new_seed = args.seed + args.n_envs + episodes_done
                     reset_obs = vec.reset_one(i, seed=new_seed)
                     raw_obs_list[i] = reset_obs
-                    encoders[i].reset()
                     managers[i].reset(reset_obs)
-                    next_obs_arr[i] = encoders[i].encode(reset_obs)
+                    if use_state_encoder:
+                        encoders[i].reset()
+                        next_obs_arr[i] = encoders[i].encode(reset_obs)
+                    else:
+                        next_obs_arr[i] = np.asarray(reset_obs, dtype=np.float32)
                     ep_ret[i] = 0.0
                     ep_steps[i] = 0
 
@@ -600,7 +622,6 @@ def main():
         f"Time: {elapsed:.1f}s ({elapsed/60:.1f} min) | "
         f"Episodes: {episodes_done} | Total steps: {total_steps:,}"
     )
-
 
 if __name__ == "__main__":
     main()
