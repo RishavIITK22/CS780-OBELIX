@@ -16,6 +16,7 @@ from torch.distributions import Categorical
 from tqdm import tqdm
 
 from behavior_manager import BEHAVIORS, FIND, PUSH, UNWEDGE, BehaviorManager, BehaviorManagerConfig
+from anti_spin_penalty import AntiSpinPenaltyConfig, AntiSpinPenaltyTracker
 from learned_latent_curiosity import LatentBeliefActorCritic, N_ACT, OBS_DIM, RunningMeanStd
 from vec_env import VecEnv
 
@@ -545,12 +546,42 @@ def save_checkpoints(out_dir: str, nets: Dict[str, LatentBeliefActorCritic], arg
         )
 
 
+def load_checkpoints(
+    load_dir: str,
+    nets: Dict[str, LatentBeliefActorCritic],
+    device: torch.device,
+) -> None:
+    missing = []
+    for behavior in BEHAVIORS:
+        path = os.path.join(load_dir, f"weights_{behavior}.pth")
+        if not os.path.exists(path):
+            missing.append(path)
+    if missing:
+        raise FileNotFoundError(
+            "Missing warm-start checkpoints:\n" + "\n".join(missing)
+        )
+
+    for behavior in BEHAVIORS:
+        path = os.path.join(load_dir, f"weights_{behavior}.pth")
+        payload = torch.load(path, map_location=device)
+        state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+        nets[behavior].load_state_dict(state_dict, strict=True)
+
+    print(f"[warm-start] Loaded three-policy checkpoints from: {load_dir}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Three-policy PPO with learned latent belief, curriculum, and curiosity on find-phase only"
     )
     ap.add_argument("--obelix_py", type=str, required=True)
     ap.add_argument("--out_dir", type=str, default="three_policy_latent_weights")
+    ap.add_argument(
+        "--load_dir",
+        type=str,
+        default=None,
+        help="Warm-start all three policies from an existing checkpoint directory containing weights_find/push/unwedge.pth",
+    )
     ap.add_argument("--episodes", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default=None)
@@ -587,6 +618,15 @@ def main():
     ap.add_argument("--intrinsic_coef", type=float, default=0.05)
     ap.add_argument("--intrinsic_clip", type=float, default=5.0)
     ap.add_argument("--no_curiosity", action="store_true")
+    ap.add_argument("--no_anti_spin", action="store_true")
+    ap.add_argument("--same_turn_threshold", type=int, default=4)
+    ap.add_argument("--same_turn_penalty", type=float, default=0.01)
+    ap.add_argument("--alternating_window", type=int, default=6)
+    ap.add_argument("--alternating_penalty", type=float, default=0.015)
+    ap.add_argument("--turn_ratio_window", type=int, default=8)
+    ap.add_argument("--turn_ratio_threshold", type=float, default=0.75)
+    ap.add_argument("--turn_ratio_penalty", type=float, default=0.01)
+    ap.add_argument("--low_progress_obs_delta", type=float, default=0.05)
 
     ap.add_argument("--obs_coef", type=float, default=0.02)
     ap.add_argument("--reward_coef", type=float, default=0.01)
@@ -619,6 +659,8 @@ def main():
         ).to(device)
         for behavior in BEHAVIORS
     }
+    if args.load_dir:
+        load_checkpoints(args.load_dir, nets, device)
     opts = {
         behavior: optim.Adam(nets[behavior].parameters(), lr=args.lr, eps=1e-5)
         for behavior in BEHAVIORS
@@ -657,6 +699,16 @@ def main():
         sticky_push=True,
         activate_push_on_ir=True,
     )
+    anti_spin_cfg = AntiSpinPenaltyConfig(
+        same_turn_threshold=args.same_turn_threshold,
+        same_turn_penalty=args.same_turn_penalty,
+        alternating_window=args.alternating_window,
+        alternating_penalty=args.alternating_penalty,
+        turn_ratio_window=args.turn_ratio_window,
+        turn_ratio_threshold=args.turn_ratio_threshold,
+        turn_ratio_penalty=args.turn_ratio_penalty,
+        low_progress_obs_delta=args.low_progress_obs_delta,
+    )
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=140)
 
@@ -669,7 +721,8 @@ def main():
             f"episodes={stage.episodes} difficulty={stage.difficulty} "
             f"wall={stage.wall_obstacles} box_speed={stage.box_speed} max_steps={stage.max_steps} "
             f"curiosity={'OFF' if args.no_curiosity else 'FIND-only'} "
-            f"repr={'latent' if args.latent_learning else 'raw'}"
+            f"repr={'latent' if args.latent_learning else 'raw'} "
+            f"anti_spin={'OFF' if args.no_anti_spin else 'find-only'}"
         )
 
         make_fns = [
@@ -679,6 +732,9 @@ def main():
         vec = VecEnv(make_fns=make_fns, reward_shaping_fn=None)
 
         managers = [BehaviorManager(manager_cfg) for _ in range(args.n_envs)]
+        anti_spin_trackers = [
+            AntiSpinPenaltyTracker(anti_spin_cfg) for _ in range(args.n_envs)
+        ]
         hidden = {
             behavior: nets[behavior].init_hidden(args.n_envs, device)
             for behavior in BEHAVIORS
@@ -688,6 +744,7 @@ def main():
         obs_arr = np.array(vec.reset(seeds=init_seeds), dtype=np.float32)
         for i in range(args.n_envs):
             managers[i].reset(obs_arr[i])
+            anti_spin_trackers[i].reset(obs_arr[i])
 
         prev_action_arr = np.full(args.n_envs, -1, dtype=np.int64)
         prev_reward_arr = np.zeros(args.n_envs, dtype=np.float32)
@@ -698,6 +755,7 @@ def main():
         stage_episodes_done = 0
         window_returns: List[float] = []
         window_steps: List[int] = []
+        window_anti_spin: List[float] = []
 
         while stage_episodes_done < stage.episodes and episodes_done < args.episodes:
             buf.clear()
@@ -768,9 +826,22 @@ def main():
                     ).astype(np.float32)
                     intrinsic_rewards[idx_t.cpu().numpy()] = intrinsic_norm
 
+                anti_spin_penalties = np.zeros(args.n_envs, dtype=np.float32)
+                if not args.no_anti_spin:
+                    for i, behavior in enumerate(behavior_ids):
+                        anti_spin_penalties[i] = anti_spin_trackers[i].step(
+                            behavior=behavior,
+                            obs=obs_arr[i],
+                            action_idx=int(action_idx[i]),
+                            next_obs=next_obs_arr[i],
+                            raw_reward=float(raw_rewards[i]),
+                            attach_reward_threshold=args.attach_reward_threshold,
+                        )
+
                 total_rewards = ext_rewards.copy()
                 find_mask = behavior_ids == FIND
                 total_rewards[find_mask] += args.intrinsic_coef * intrinsic_rewards[find_mask]
+                total_rewards += anti_spin_penalties
 
                 buf.add_batch(
                     obs=obs_arr,
@@ -789,6 +860,7 @@ def main():
 
                 ep_ret += total_rewards
                 ep_steps += 1
+                window_anti_spin.extend(anti_spin_penalties.tolist())
                 total_steps += args.n_envs
                 last_done[:] = dones
 
@@ -829,6 +901,7 @@ def main():
                     reset_obs = vec.reset_one(i, seed=new_seed)
                     next_obs_arr[i] = np.array(reset_obs, dtype=np.float32)
                     managers[i].reset(next_obs_arr[i])
+                    anti_spin_trackers[i].reset(next_obs_arr[i])
                     next_prev_action_arr[i] = -1
                     next_prev_reward_arr[i] = 0.0
                     next_prev_done_arr[i] = 1.0
@@ -916,6 +989,10 @@ def main():
                     f"│ Avg Return    : {np.mean(window_returns):8.2f}   "
                     f"Best Return : {best_return:8.2f}   Rolling Success(200 ep): {rolling_success:6.2f}%"
                 )
+                if window_anti_spin:
+                    tqdm.write(
+                        f"│ Avg anti-spin penalty/step : {np.mean(window_anti_spin):8.4f}"
+                    )
                 tqdm.write(
                     f"│ Avg Steps     : {np.mean(window_steps):8.1f}   Updates : {update_count}   Total steps : {total_steps:,}"
                 )
@@ -933,6 +1010,7 @@ def main():
                 last_log_ep = episodes_done
                 window_returns.clear()
                 window_steps.clear()
+                window_anti_spin.clear()
 
         vec.close()
         if episodes_done >= args.episodes:

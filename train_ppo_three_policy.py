@@ -37,6 +37,7 @@ from behavior_manager import (
     BehaviorManager,
     BehaviorManagerConfig,
 )
+from anti_spin_penalty import AntiSpinPenaltyConfig, AntiSpinPenaltyTracker
 from state_encoder import BeliefStateEncoder
 from vec_env import VecEnv
 
@@ -321,6 +322,15 @@ def main():
 
     ap.add_argument("--reward_scale", type=float, default=20.0)
     ap.add_argument("--min_samples_per_behavior", type=int, default=100)
+    ap.add_argument("--no_anti_spin", action="store_true")
+    ap.add_argument("--same_turn_threshold", type=int, default=4)
+    ap.add_argument("--same_turn_penalty", type=float, default=0.01)
+    ap.add_argument("--alternating_window", type=int, default=6)
+    ap.add_argument("--alternating_penalty", type=float, default=0.015)
+    ap.add_argument("--turn_ratio_window", type=int, default=8)
+    ap.add_argument("--turn_ratio_threshold", type=float, default=0.75)
+    ap.add_argument("--turn_ratio_penalty", type=float, default=0.01)
+    ap.add_argument("--low_progress_obs_delta", type=float, default=0.05)
 
     ap.add_argument("--push_linger_steps", type=int, default=5)
     ap.add_argument("--unwedge_linger_steps", type=int, default=5)
@@ -355,6 +365,19 @@ def main():
         activate_push_on_ir=True,
     )
     managers = [BehaviorManager(manager_cfg) for _ in range(args.n_envs)]
+    anti_spin_cfg = AntiSpinPenaltyConfig(
+        same_turn_threshold=args.same_turn_threshold,
+        same_turn_penalty=args.same_turn_penalty,
+        alternating_window=args.alternating_window,
+        alternating_penalty=args.alternating_penalty,
+        turn_ratio_window=args.turn_ratio_window,
+        turn_ratio_threshold=args.turn_ratio_threshold,
+        turn_ratio_penalty=args.turn_ratio_penalty,
+        low_progress_obs_delta=args.low_progress_obs_delta,
+    )
+    anti_spin_trackers = [
+        AntiSpinPenaltyTracker(anti_spin_cfg) for _ in range(args.n_envs)
+    ]
 
     obs_dim = encoders[0].output_dim if use_state_encoder else 18
     nets = {
@@ -381,6 +404,7 @@ def main():
     raw_obs_list = vec.reset(seeds=init_seeds)
     for i in range(args.n_envs):
         managers[i].reset(raw_obs_list[i])
+        anti_spin_trackers[i].reset(raw_obs_list[i])
         if use_state_encoder:
             encoders[i].reset()
     if use_state_encoder:
@@ -400,6 +424,7 @@ def main():
     best_avg_return = -float("inf")
     window_returns: List[float] = []
     window_steps: List[int] = []
+    window_anti_spin: List[float] = []
     success_count = 0
     recent_metrics = {
         behavior: collections.defaultdict(lambda: collections.deque(maxlen=20))
@@ -416,7 +441,8 @@ def main():
     print(
         f"[Three-Policy PPO] policies={', '.join(BEHAVIORS)} "
         f"difficulty={args.difficulty} wall={args.wall_obstacles} "
-        f"repr={'state-encoder' if use_state_encoder else 'raw'}\n"
+        f"repr={'state-encoder' if use_state_encoder else 'raw'} "
+        f"anti_spin={'OFF' if args.no_anti_spin else 'find-only'}\n"
     )
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=120)
@@ -465,6 +491,18 @@ def main():
                 next_obs_arr = np.asarray(next_raw_obs_list, dtype=np.float32)
 
             scaled_rewards = raw_rewards / args.reward_scale
+            anti_spin_penalties = np.zeros(args.n_envs, dtype=np.float32)
+            if not args.no_anti_spin:
+                for i, behavior in enumerate(current_behaviors):
+                    anti_spin_penalties[i] = anti_spin_trackers[i].step(
+                        behavior=behavior,
+                        obs=raw_obs_list[i],
+                        action_idx=int(action_indices[i]),
+                        next_obs=next_raw_obs_list[i],
+                        raw_reward=float(raw_rewards[i]),
+                        attach_reward_threshold=args.attach_reward_threshold,
+                    )
+            shaped_rewards = scaled_rewards + anti_spin_penalties
 
             for i, behavior in enumerate(current_behaviors):
                 buffers[behavior].add_step(
@@ -472,12 +510,13 @@ def main():
                     obs=obs_arr[i],
                     action=action_indices[i],
                     log_prob=log_probs[i],
-                    reward=float(scaled_rewards[i]),
+                    reward=float(shaped_rewards[i]),
                     value=float(values[i]),
                 )
 
-            ep_ret += scaled_rewards
+            ep_ret += shaped_rewards
             ep_steps += 1
+            window_anti_spin.extend(anti_spin_penalties.tolist())
             total_steps += args.n_envs
 
             for i, behavior in enumerate(current_behaviors):
@@ -506,6 +545,7 @@ def main():
                     reset_obs = vec.reset_one(i, seed=new_seed)
                     raw_obs_list[i] = reset_obs
                     managers[i].reset(reset_obs)
+                    anti_spin_trackers[i].reset(reset_obs)
                     if use_state_encoder:
                         encoders[i].reset()
                         next_obs_arr[i] = encoders[i].encode(reset_obs)
@@ -591,6 +631,10 @@ def main():
                 f"│ Avg Return : {avg_return:8.2f}   Avg Steps : {np.mean(window_steps):6.1f}   "
                 f"Successes : {success_count}"
             )
+            if window_anti_spin:
+                tqdm.write(
+                    f"│ Avg anti-spin penalty/step : {np.mean(window_anti_spin):8.4f}"
+                )
             tqdm.write(
                 f"│ Behavior steps : find={behavior_steps[FIND]:,} push={behavior_steps[PUSH]:,} "
                 f"unwedge={behavior_steps[UNWEDGE]:,}   Updates : {update_count}"
@@ -610,6 +654,7 @@ def main():
             last_log_ep = episodes_done
             window_returns.clear()
             window_steps.clear()
+            window_anti_spin.clear()
 
     pbar.close()
     vec.close()
