@@ -28,7 +28,14 @@ class OBELIX:
         self.bot_center_y = 200
         self.bot_color = (255, 255, 255)
 
-        self.move_options = {"L45": 45, "L22": 22.5, "FW": 0, "R22": -22.5, "R45": -45}
+        self.move_options = {
+            "L45": 45,
+            "L22": 22.5,
+            "FW": 0,
+            "R22": -22.5,
+            "R45": -45,
+            "IDLE": None,
+        }
         self.forward_step_unit = 5
 
         self.sonar_fov = 20
@@ -621,9 +628,12 @@ class OBELIX:
         self._update_box_dynamics()
 
         angle_change = self.move_options[move]
-        self.facing_angle += angle_change
+        if angle_change is not None:
+            self.facing_angle += angle_change
         self.active_state = "F"
-        if angle_change == 0:
+        if angle_change is None:
+            self.stuck_flag = 0
+        elif angle_change == 0:
             bot_center_x_t = int(
                 self.bot_center_x
                 + self.forward_step_unit * np.cos(np.deg2rad(self.facing_angle))

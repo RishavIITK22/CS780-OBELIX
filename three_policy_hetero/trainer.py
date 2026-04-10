@@ -27,6 +27,8 @@ from behavior_manager import (
 from three_policy_hetero.adapters import FrameStackAdapter, IdentityAdapter
 from three_policy_hetero.models import MLPActorCritic, RecurrentActorCritic
 from three_policy_hetero.reward_hooks import (
+    FindRewardHook,
+    FindShapeConfig,
     NullRewardHook,
     PushRewardHook,
     PushShapeConfig,
@@ -376,7 +378,7 @@ def make_env_fn(OBELIX, args, worker_seed: int):
 
 def build_behavior_specs(args) -> Dict[str, BehaviorSpec]:
     return {
-        FIND: BehaviorSpec(args.find_arch, args.find_hidden, stack_k=args.find_stack, shape_reward=False),
+        FIND: BehaviorSpec(args.find_arch, args.find_hidden, stack_k=args.find_stack, shape_reward=not args.no_find_shaping),
         PUSH: BehaviorSpec(args.push_arch, args.push_hidden, stack_k=args.push_stack, shape_reward=not args.no_push_shaping),
         UNWEDGE: BehaviorSpec(args.unwedge_arch, args.unwedge_hidden, stack_k=args.unwedge_stack, shape_reward=not args.no_unwedge_shaping),
     }
@@ -420,12 +422,24 @@ def build_behavior_components(args, specs: Dict[str, BehaviorSpec], n_envs: int,
         else:
             raise ValueError(f"Unsupported architecture for {behavior}: {spec.architecture}")
 
-        if behavior == PUSH and spec.shape_reward:
+        if behavior == FIND and spec.shape_reward:
+            hook_factory = lambda: FindRewardHook(
+                FindShapeConfig(
+                    far_sensor_bonus=args.find_far_sensor_bonus,
+                    near_sensor_bonus=args.find_near_sensor_bonus,
+                    stuck_penalty_base=args.find_stuck_penalty_base,
+                    stuck_penalty_growth=args.find_stuck_penalty_growth,
+                    max_stuck_penalty=args.find_max_stuck_penalty,
+                )
+            )
+        elif behavior == PUSH and spec.shape_reward:
             hook_factory = lambda: PushRewardHook(
                 PushShapeConfig(
                     contact_bonus=args.push_contact_bonus,
                     forward_bonus=args.push_forward_bonus,
-                    stuck_penalty=args.push_stuck_penalty,
+                    stuck_penalty_base=args.push_stuck_penalty_base,
+                    stuck_penalty_growth=args.push_stuck_penalty_growth,
+                    max_stuck_penalty=args.push_max_stuck_penalty,
                 )
             )
         elif behavior == UNWEDGE and spec.shape_reward:
@@ -433,6 +447,9 @@ def build_behavior_components(args, specs: Dict[str, BehaviorSpec], n_envs: int,
                 UnwedgeShapeConfig(
                     recover_bonus=args.unwedge_recover_bonus,
                     repeat_turn_penalty=args.unwedge_repeat_turn_penalty,
+                    stuck_penalty_base=args.unwedge_stuck_penalty_base,
+                    stuck_penalty_growth=args.unwedge_stuck_penalty_growth,
+                    max_stuck_penalty=args.unwedge_max_stuck_penalty,
                 )
             )
         else:
@@ -531,13 +548,24 @@ def main():
     ap.add_argument("--turn_ratio_penalty", type=float, default=0.01)
     ap.add_argument("--low_progress_obs_delta", type=float, default=0.05)
 
+    ap.add_argument("--no_find_shaping", action="store_true")
     ap.add_argument("--no_push_shaping", action="store_true")
     ap.add_argument("--no_unwedge_shaping", action="store_true")
+    ap.add_argument("--find_far_sensor_bonus", type=float, default=0.002)
+    ap.add_argument("--find_near_sensor_bonus", type=float, default=0.005)
+    ap.add_argument("--find_stuck_penalty_base", type=float, default=0.01)
+    ap.add_argument("--find_stuck_penalty_growth", type=float, default=0.005)
+    ap.add_argument("--find_max_stuck_penalty", type=float, default=0.08)
     ap.add_argument("--push_contact_bonus", type=float, default=0.01)
     ap.add_argument("--push_forward_bonus", type=float, default=0.005)
-    ap.add_argument("--push_stuck_penalty", type=float, default=0.01)
+    ap.add_argument("--push_stuck_penalty_base", type=float, default=0.01)
+    ap.add_argument("--push_stuck_penalty_growth", type=float, default=0.005)
+    ap.add_argument("--push_max_stuck_penalty", type=float, default=0.08)
     ap.add_argument("--unwedge_recover_bonus", type=float, default=0.05)
     ap.add_argument("--unwedge_repeat_turn_penalty", type=float, default=0.01)
+    ap.add_argument("--unwedge_stuck_penalty_base", type=float, default=0.01)
+    ap.add_argument("--unwedge_stuck_penalty_growth", type=float, default=0.005)
+    ap.add_argument("--unwedge_max_stuck_penalty", type=float, default=0.08)
 
     ap.add_argument("--push_linger_steps", type=int, default=5)
     ap.add_argument("--unwedge_linger_steps", type=int, default=5)
@@ -573,7 +601,7 @@ def main():
         unwedge_linger_steps=args.unwedge_linger_steps,
         attach_reward_threshold=args.attach_reward_threshold,
         sticky_push=True,
-        activate_push_on_ir=True,
+        activate_push_on_ir=False,
     )
     managers = [BehaviorManager(manager_cfg) for _ in range(args.n_envs)]
     anti_spin_cfg = AntiSpinPenaltyConfig(
@@ -627,9 +655,11 @@ def main():
         f"unwedge={specs[UNWEDGE].architecture}/{specs[UNWEDGE].hidden_dim}"
     )
     print(
-        f"[Three-Policy Hetero PPO] push_shaping={'OFF' if args.no_push_shaping else 'ON'} "
+        f"[Three-Policy Hetero PPO] find_shaping={'OFF' if args.no_find_shaping else 'ON'} "
+        f"push_shaping={'OFF' if args.no_push_shaping else 'ON'} "
         f"unwedge_shaping={'OFF' if args.no_unwedge_shaping else 'ON'} "
-        f"anti_spin={'OFF' if args.no_anti_spin else 'FIND-only'}"
+        f"anti_spin={'OFF' if args.no_anti_spin else 'FIND-only'} "
+        f"push_activation=reward-spike"
     )
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=140)
