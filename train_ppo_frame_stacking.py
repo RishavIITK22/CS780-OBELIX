@@ -363,15 +363,16 @@ def main():
     ap.add_argument("--stack", type=int, default=8)
 
     # ── Reward shaping ─────────────────────────────────────────────────────
-    ap.add_argument("--reward_scale",     type=float, default=20.0)
-    ap.add_argument("--approach_scale",   type=float, default=3.0)
-    ap.add_argument("--push_scale",       type=float, default=4.0)
-    ap.add_argument("--stuck_penalty",    type=float, default=2.0)
-    ap.add_argument("--spin_penalty",     type=float, default=2.0)
-    ap.add_argument("--spin_threshold",   type=int,   default=6)
-    ap.add_argument("--forward_bonus",    type=float, default=1.0)
-    ap.add_argument("--efficiency_bonus", type=float, default=10.0)
-    ap.add_argument("--no_shaping",       action="store_true")
+    ap.add_argument("--reward_scale", type=float, default=20.0)
+    ap.add_argument("--find_sensor_bonus", type=float, default=0.4)
+    ap.add_argument("--find_front_bonus", type=float, default=0.8)
+    ap.add_argument("--ir_bonus", type=float, default=1.0)
+    ap.add_argument("--push_forward_bonus", type=float, default=2.0)
+    ap.add_argument("--stuck_penalty", type=float, default=2.0)
+    ap.add_argument("--stuck_penalty_growth", type=float, default=2.0)
+    ap.add_argument("--recovery_bonus", type=float, default=1.0)
+    ap.add_argument("--attach_reward_threshold", type=float, default=90.0)
+    ap.add_argument("--no_shaping", action="store_true")
     args = ap.parse_args()
 
     device = torch.device(args.device) if args.device else DEVICE
@@ -393,15 +394,14 @@ def main():
     encoders = [BeliefStateEncoder(stack_k=args.stack) for _ in range(args.n_envs)]
     shapers = [
         RewardShaper(
-            reward_scale     = args.reward_scale,
-            approach_scale   = args.approach_scale,
-            push_scale       = args.push_scale,
-            stuck_penalty    = args.stuck_penalty,
-            spin_penalty     = args.spin_penalty,
-            spin_threshold   = args.spin_threshold,
-            forward_bonus    = args.forward_bonus,
-            efficiency_bonus = args.efficiency_bonus,
-            max_steps        = args.max_steps,
+            reward_scale=args.reward_scale,
+            find_sensor_bonus=args.find_sensor_bonus,
+            find_front_bonus=args.find_front_bonus,
+            ir_bonus=args.ir_bonus,
+            push_forward_bonus=args.push_forward_bonus,
+            stuck_penalty=args.stuck_penalty,
+            stuck_penalty_growth=args.stuck_penalty_growth,
+            recovery_bonus=args.recovery_bonus,
         )
         for _ in range(args.n_envs)
     ]
@@ -440,6 +440,7 @@ def main():
 
     window_returns: List[float] = []
     window_steps:   List[int]   = []
+    window_shaping_delta: List[float] = []
     success_count  = 0
 
     recent_metrics = collections.defaultdict(lambda: collections.deque(maxlen=20))
@@ -479,7 +480,16 @@ def main():
           f"rollout_len={args.rollout_len}  "
           f"total_per_update={args.rollout_len * args.n_envs}")
     print(f"[PPO-VecEnv] episodes={args.episodes}  device={device}  "
-          f"reward_shaping={'OFF' if args.no_shaping else 'ON'}\n")
+          f"reward_shaping={'OFF' if args.no_shaping else 'simple'}")
+    if not args.no_shaping:
+        print(
+            f"[PPO-VecEnv] shaper find_sensor={args.find_sensor_bonus} "
+            f"find_front={args.find_front_bonus} ir={args.ir_bonus} "
+            f"push_fw={args.push_forward_bonus} stuck={args.stuck_penalty}+"
+            f"{args.stuck_penalty_growth} recovery={args.recovery_bonus}\n"
+        )
+    else:
+        print()
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=110)
 
@@ -513,7 +523,7 @@ def main():
 
                 # Use reward spike to latch push_active — IR bit is NOT sticky
                 # and can drop to 0 mid-push, so raw_obs2_list[i][16] is wrong.
-                if raw_rewards[i] >= 90.0:
+                if raw_rewards[i] >= args.attach_reward_threshold:
                     push_active[i] = True
 
                 if args.no_shaping:
@@ -528,6 +538,7 @@ def main():
                         enable_push=bool(push_active[i]),
                         action=action_strs[i],
                     )
+                    window_shaping_delta.append(float(shaped_rewards[i] - scaled))
 
             buf.add_batch(
                 obs       = obs_arr,
@@ -633,11 +644,14 @@ def main():
                 f"│  Entropy      : {np.mean(recent_metrics['entropy']):>8.4f}   "
                 f"Approx KL  : {np.mean(recent_metrics['approx_kl']):.4f}   "
                 f"LR : {scheduler.get_last_lr()[0]:.2e}\n"
+                f"│  Shaper Δ/step: "
+                f"{(np.mean(window_shaping_delta) if window_shaping_delta else 0.0):>8.4f}\n"
                 f"└{'─'*64}"
             )
             last_log_ep = episodes_done
             window_returns.clear()
             window_steps.clear()
+            window_shaping_delta.clear()
 
     pbar.close()
     vec.close()

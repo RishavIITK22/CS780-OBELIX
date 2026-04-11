@@ -659,7 +659,7 @@ def main():
             cur_size = 500
         e = OBELIX(
             scaling_factor=args.scaling_factor,
-            arena_size=500,
+            arena_size=cur_size,
             max_steps=args.max_steps,
             wall_obstacles=args.wall_obstacles,
             difficulty=args.difficulty,
@@ -688,6 +688,7 @@ def main():
 
     box_attached        = False
     push_grace          = 0
+    ir_streak           = 0   # consecutive steps IR is active; threshold=2 before push_grace fires
     PUSH_GRACE_STEPS    = 7
     unwedge_steps       = 0
     unwedge_active      = False
@@ -732,9 +733,13 @@ def main():
                     post_unwedge_cooldown -= 1
 
                 if ir_on and post_unwedge_cooldown == 0:
-                    push_grace = PUSH_GRACE_STEPS
-                elif push_grace > 0:
-                    push_grace -= 1
+                    ir_streak += 1
+                    if ir_streak >= 2:          # require persistent IR, not a single-step wall flash
+                        push_grace = PUSH_GRACE_STEPS
+                else:
+                    ir_streak = 0
+                    if push_grace > 0:
+                        push_grace -= 1
 
                 if unwedge_active:
                     mode = "unwedge"
@@ -760,12 +765,12 @@ def main():
 
                         if mode == "find":
                             bias = torch.tensor([-0.25, 1.0, -0.25], device=device)
-                            action, log_prob, _, value = ag["net"].get_action(st)
+                            action, log_prob, _, value = ag["net"].get_action(st, logit_bias=bias)
                             a_idx = int(action.item())
 
                         elif mode == "push":
                             bias = torch.tensor([-1.0, 1.0, -1.0], device=device)
-                            action, log_prob, _, value = ag["net"].get_action(st)
+                            action, log_prob, _, value = ag["net"].get_action(st, logit_bias=bias)
                             a_idx = int(action.item())
 
                         else:  # unwedge — GRU path
@@ -812,9 +817,12 @@ def main():
                         #r += 20
 
                 if mode == "push":
-                    if a_idx == 1 and raw[16] == 1 and raw2[17] == 0 and box_attached:
+                    # Reward FW whenever not stuck; penalise getting stuck.
+                    # box_attached condition removed — the probe rarely fires,
+                    # so the old gate prevented the push head from ever training.
+                    if a_idx == 1 and raw2[17] == 0:
                         r += 3.0
-                    else:
+                    elif raw2[17] == 1:
                         r -= 3.0
 
                 else:  # unwedge
@@ -877,6 +885,7 @@ def main():
                     ep_find = ep_push = ep_unwedge = 0
                     box_attached          = False
                     push_grace            = 0
+                    ir_streak             = 0
                     unwedge_active        = False
                     unwedge_grace         = 0
                     unwedge_steps         = 0
@@ -933,7 +942,7 @@ def main():
                 print(f"  [update:{name}] steps={buf.ptr} | "
                       f"pg={pg:.4f} vf={vf:.4f} ent={ent:.4f}")
 
-            if ep > 0 and ep % 1 == 0:
+            if ep > 0 and ep % 100 == 0:
                 save_checkpoint(os.path.join(args.out_dir, "checkpoint_latest.pth"), agents, ep, steps)
 
     except KeyboardInterrupt:

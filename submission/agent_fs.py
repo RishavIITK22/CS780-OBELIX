@@ -168,7 +168,8 @@ class _ActorCritic(nn.Module):
         self.critic = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor):
-        return self.actor(self.trunk(x)), self.critic(self.trunk(x)).squeeze(-1)
+        h = self.trunk(x)
+        return self.actor(h), self.critic(h).squeeze(-1)
 
 
 # ── Module-level persistent state ─────────────────────────────────────────────
@@ -194,7 +195,19 @@ def _load_once() -> None:
         return
 
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("weights_ppo_fs.pth", "weights_ppo.pth", "weights.pth"):
+    for name in (
+        "weights_ppo_fs.pth.best",
+        "weights_ppo_fs.pth",
+        "weights_frame_stacking.pth.best",
+        "weights_frame_stacking.pth",
+        "weights_frame_stack.pth.best",
+        "weights_frame_stack.pth",
+        "weights_frame_stack_d3.pth.best",
+        "weights_frame_stack_d3.pth",
+        "weights.pth.best",
+        "weights_ppo.pth",
+        "weights.pth",
+    ):
         p = os.path.join(here, name)
         if os.path.exists(p):
             wpath = p
@@ -202,10 +215,12 @@ def _load_once() -> None:
     else:
         raise FileNotFoundError(
             "No weights file found next to agent_fs.py. "
-            "Expected 'weights_ppo_fs.pth', 'weights_ppo.pth', or 'weights.pth'."
+            "Expected a frame-stacking checkpoint such as "
+            "'weights_ppo_fs.pth', 'weights_frame_stacking.pth', "
+            "'weights_frame_stack.pth', or 'weights.pth'."
         )
 
-    sd = torch.load(wpath, map_location="cpu")
+    sd = torch.load(wpath, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
 
@@ -230,7 +245,7 @@ def _load_once() -> None:
 
 # ── Policy ────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
+def policy(obs: np.ndarray, rng: Optional[np.random.Generator] = None) -> str:
     global _step_count, _prev_action_idx
 
     _load_once()

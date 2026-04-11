@@ -15,6 +15,7 @@ BEHAVIORS = (FIND, PUSH, UNWEDGE)
 class BehaviorManagerConfig:
     push_linger_steps:       int   = 5
     unwedge_linger_steps:    int   = 5
+    post_unwedge_cooldown_steps: int = 0
     attach_reward_threshold: float = 90.0
     sticky_push:             bool  = True
     activate_push_on_ir:     bool  = False
@@ -78,6 +79,7 @@ class BehaviorManager:
         self._push_active      = False
         self._push_timer       = 0
         self._unwedge_timer    = 0
+        self._post_unwedge_cooldown = 0
         self._prev_ir          = False
 
         if obs is not None:
@@ -118,11 +120,19 @@ class BehaviorManager:
         stuck = self._is_stuck(obs)
         ir_on = self._has_ir(obs)
         ir_rising = ir_on and not self._prev_ir
+        was_unwedge_active = self._unwedge_timer > 0
 
         # ── Push state machine ────────────────────────────────────────────────
+        if self._post_unwedge_cooldown > 0:
+            self._post_unwedge_cooldown -= 1
+
         attach_event = (
             raw_reward >= self.config.attach_reward_threshold
-            or (self.config.activate_push_on_ir and ir_rising)
+            or (
+                self.config.activate_push_on_ir
+                and ir_rising
+                and self._post_unwedge_cooldown == 0
+            )
         )
 
         if attach_event:
@@ -147,6 +157,12 @@ class BehaviorManager:
             self._unwedge_timer = self.config.unwedge_linger_steps
         elif self._unwedge_timer > 0:
             self._unwedge_timer -= 1
+            if (
+                was_unwedge_active
+                and self._unwedge_timer == 0
+                and self.config.post_unwedge_cooldown_steps > 0
+            ):
+                self._post_unwedge_cooldown = self.config.post_unwedge_cooldown_steps
 
         self._prev_ir = ir_on
 

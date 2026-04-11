@@ -1,0 +1,325 @@
+\documentclass[11pt, oneside]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[numbers]{natbib}
+\usepackage{graphicx}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{multirow}
+
+\title{CS780 Capstone Project:\\
+OBELIX: the Warehouse Robot}
+
+\author{
+    FirstName $<$Middle Name if any$>$ LastName  \\
+    roll no.\\
+   {\tt \{name\}@iitk.ac.in}\\
+{Indian Institute of Technology Kanpur (IIT Kanpur)}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We tackle OBELIX, a warehouse robot POMDP task where an agent must find, attach to, push, and unwedge a grey box to the arena boundary using only binary sonar and IR sensors.
+We explored Double DQN, vanilla PPO, PPO with frame stacking, PPO with LSTM, a three-policy hierarchical architecture, GRU-based multi-head PPO, and a final Explicit Phase Belief (EPB) agent that replaces recurrent memory with a hand-crafted non-decaying 16-dimensional belief state.
+A key finding was that reward shaping and encoded observations hurt performance compared to raw reward PPO.
+The best codabench score of $+157.4$ was achieved by the GRU-based agent trained without reward shaping.
+\end{abstract}
+
+
+\section{Competition Result}
+\textbf{Codabench Username:} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Final leaderboard rank (Test Phase):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank -- Level 1 (static):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank -- Level 2 (blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank -- Level 3 (moving + blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
+
+\vspace{0.5em}
+\textbf{Number of valid submissions (Development and Test):}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Phase & Agent & Mean Score & Std & Runs \\
+\midrule
+Dev (Feb 11) & agent\_template & $-13931.0$ & $8342.4$ & 3 \\
+Dev (Feb 11) & agent\_template & $-16100.7$ & $10503.0$ & 3 \\
+Dev (Mar 22) & agent (PPO, raw obs) & $+229.9$ & $1506.3$ & 10 \\
+Dev (Mar 22) & agent (PPO, raw obs) & $+539.9$ & $1539.9$ & 10 \\
+Dev (Mar 22) & agent (PPO, raw obs) & $+537.2$ & $1537.2$ & 10 \\
+Dev (Mar 22) & agent (PPO, shaped) & $-111868.2$ & $93154.5$ & 10 \\
+Dev (Mar 22) & agent (PPO, shaped+walls) & $-136026.6$ & $90449.6$ & 10 \\
+Dev (Mar 29) & agent (Phase 2 final) & $-238.6$ & $2300.1$ & 10 \\
+Dev (Apr 5) & agent\_three\_policy & $-31641.8$ & $67989.9$ & 10 \\
+Dev (Apr 7) & agent\_three\_policy & $-73666.1$ & $92732.4$ & 10 \\
+Dev (Apr 7) & agent\_three\_policy (walls) & $-158772.2$ & $73982.4$ & 10 \\
+Dev (Apr 7) & agent\_three\_policy\_latent & $-114049.1$ & $94840.9$ & 10 \\
+Dev (Apr 10) & agent\_ppo\_gru\_un & $-394.2$ & $4092.0$ & 10 \\
+Dev (Apr 10) & agent\_ppo\_gru\_un (walls) & $+157.4$ & $1398.6$ & 10 \\
+\bottomrule
+\end{tabular}
+\caption{All development submissions. Scores reported by codabench (scaling factor $\times 5$, 1000 max steps).}
+\label{tab:submissions}
+\end{table}
+
+
+\section{Introduction and Problem Description}
+
+OBELIX is a simulated warehouse robot task that requires an autonomous agent to navigate a 2D arena, locate a grey box, attach to it by approaching head-on, push the box to any boundary wall, and handle cases where the box becomes wedged in a corner (the ``unwedge'' phase).
+The challenge is designed to be a realistic Partially Observable Markov Decision Process (POMDP): the robot has \emph{no global position or orientation}, and can only observe 18 binary sensor bits: 4 left sonar readings (near/far $\times$ 2 beams), 8 front sonar readings (near/far $\times$ 4 beams), 4 right sonar readings (near/far $\times$ 2 beams), one IR proximity sensor (object at $<4$~inches), and one stuck flag (motor current exceeded threshold).
+
+The task unfolds in three difficulty levels:
+\begin{itemize}[noitemsep]
+    \item \textbf{Level 1 (static):} The box remains stationary. The robot must find and push it to a wall.
+    \item \textbf{Level 2 (blinking):} The box periodically disappears and reappears. Sensors may return false negatives, breaking naive reactive strategies.
+    \item \textbf{Level 3 (moving + blinking):} The box drifts autonomously in addition to blinking, making prediction and interception necessary.
+\end{itemize}
+An optional wall-obstacle variant places internal walls in the arena, requiring collision-aware navigation.
+
+The POMDP nature makes this problem hard: the box may be invisible for hundreds of consecutive steps, the robot cannot localise itself, the phase transitions (find $\to$ push $\to$ unwedge) must be inferred purely from sensor evidence, and exploration is structureless without any global map.
+The objective is to maximise mean cumulative reward (per episode, scaled by 5) across all difficulties, with a maximum of 1000 steps per episode.
+
+
+\section{Approach and Model Evolution}
+
+\subsection{Phase 1: Double DQN Baseline}
+
+The starting point was a Double DQN (DDQN) agent trained on the raw 18-dimensional binary observation.
+The network was a three-layer MLP (18~$\to$~64~$\to$~64~$\to$~5) with $\epsilon$-greedy exploration.
+A vectorised environment (\texttt{vec\_env.py}) was written to run $N$ OBELIX instances in parallel subprocesses for faster data collection.
+A \texttt{RewardShaper} (\texttt{reward\_shaper.py}) was also implemented, adding sensor-evidence bonuses during the find phase, a forward-progress bonus during push, an escalating stuck penalty, and a recovery bonus.
+A \texttt{BeliefStateEncoder} (\texttt{state\_encoder.py}) was implemented to enrich the 18-bit observation with sector strengths, direction summaries, temporal memory flags, and transition cues, producing a 49-dimensional per-frame core which could be further stacked across $k$ timesteps.
+
+DDQN with shaped rewards and encoded observations produced poor results on local evaluation; the results from the early template agent on codabench confirmed this ($-13931$, $-16100$, Table~\ref{tab:submissions}).
+
+\subsection{Phase 2: PPO and the Surprising Benefit of Simplicity}
+
+Switching to Proximal Policy Optimisation (PPO) with a shared-trunk MLP actor-critic (two Tanh hidden layers, 128 units each) and raw 18-dimensional observations showed a dramatic improvement.
+When trained \emph{without} reward shaping and \emph{without} encoded observations, codabench mean scores reached $+229.9$ and then $+539.9$.
+By contrast, enabling the \texttt{RewardShaper} and \texttt{BeliefStateEncoder} on the same PPO architecture led to scores of $-111{,}868$ and $-136{,}027$ -- roughly three orders of magnitude worse.
+
+This result was unexpected and informative: the hand-crafted shaping terms and engineered features were actively misleading the agent, either introducing conflicting gradients or preventing the policy from learning the actual task reward signal.
+The conclusion drawn was that for a sparse-reward POMDP of this type, \emph{clean raw observations and unmodified environment rewards are preferable} to dense shaping.
+
+PPO with frame stacking (stacking $k$ raw observations) was also evaluated.
+It gave modest improvements on local evaluation but did not clearly outperform the single-frame baseline on codabench.
+
+An LSTM-augmented policy (\texttt{train\_ppo\_lstm.py}) was tried next as a natural extension for handling partial observability.
+The LSTM maintained a hidden state across timesteps and could, in principle, remember the last box direction across blank sensor steps.
+However, in practice the LSTM agent also failed to match the raw-PPO baseline, particularly when combined with shaped rewards.
+By the end of Phase 2, the best performing checkpoint remained the plain PPO agent with raw observations and unshaped rewards, scoring $-238.6$ in the final Phase~2 submission.
+
+\subsection{Phase 3: Three-Policy Architecture and GRU Recovery}
+
+Motivated by reading the OBELIX paper~\cite{obelix}, Phase 3 explored a behaviour-decomposed architecture matching the paper's three-behaviour hierarchy:
+\[
+\text{unwedge} \succ \text{push} \succ \text{find}
+\]
+A \texttt{BehaviorManager} (\texttt{behavior\_manager.py}) selected the active sub-policy at each step based on sensor evidence.
+Three independent PPO actor-critic heads were trained, each receiving the same 18-bit (or encoded) observation.
+An \texttt{AntiSpinPenaltyTracker} (\texttt{anti\_spin\_penalty.py}) was added to penalise repetitive rotation during the find phase.
+
+Despite alignment with the paper's intuition, the three-policy agent performed poorly in practice.
+Codabench scores ranged from $-31{,}641$ to $-158{,}772$ across variants.
+Switching to a latent-space version (\texttt{agent\_three\_policy\_latent}) did not help, yielding $-114{,}049$.
+The likely cause was policy interference: the sharp handoffs between sub-policies produced inconsistent reward signals, and the naive FSM phase detector frequently mis-classified the current phase.
+
+Recognising the failure of hard phase-switching, the next attempt (\texttt{ppo\_gru.py}, \texttt{agent\_ppo\_gru\_un.py}) replaced the three separate heads with a unified agent containing:
+\begin{itemize}[noitemsep]
+    \item An MLP actor-critic for the find and push phases (shared backbone, 18 $\to$ 128 $\to$ 128, Tanh).
+    \item A separate GRU-based actor-critic for the unwedge phase, where temporal context matters most for detecting that the box is wedged.
+    \item A rule-based phase selector that latches on IR attachment.
+\end{itemize}
+This agent was trained without any reward shaping, directly on the raw environment reward.
+It achieved codabench scores of $-394.2$ and $+157.4$, the best result of the project.
+
+\subsection{EPB: Explicit Phase Belief Agent (Final Approach)}
+
+The GRU agent suffered from a known failure mode: after many consecutive blank sensor steps (common in Level~2 and Level~3), the GRU hidden state is washed toward zero by the recurrent dynamics, erasing the last-known box direction.
+Phase mis-detection by the FSM also caused spurious transitions.
+
+To address both issues, the \textbf{Explicit Phase Belief (EPB)} agent (\texttt{train\_ppo\_epb.py}, \texttt{agent\_epb.py}) was designed around a hand-crafted 16-dimensional belief state (\texttt{compact\_belief.py}):
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Non-decaying last-visible direction:} Fields \texttt{last\_visible\_left/front/right/ir} update \emph{only when a sensor fires} and never decay on blank steps.
+    \item \textbf{Staleness counter:} \texttt{steps\_since\_visible} counts up (capped at 500); the agent knows how stale its last sighting is.
+    \item \textbf{Attachment latch:} \texttt{attached} latches True on two consecutive IR activations and is never reset within an episode.
+    \item \textbf{Stuck severity, recovery edge, exploration direction:} additional scalars for nuanced behaviour.
+\end{itemize}
+
+The 39-dimensional input to the policy is:
+\[
+[\underbrace{\text{raw obs}}_{18} \;\|\; \underbrace{\text{belief vector}}_{16} \;\|\; \underbrace{\text{FSM one-hot}}_{5}]
+\]
+The FSM one-hot encodes a reactive hand-coded action suggestion (orient toward nearest sensor, spin if blind, push forward if attached) as a soft prior.
+
+The network is a \textbf{dual-head actor-critic}: a shared MLP trunk (39~$\to$~128~$\to$~128, Tanh) feeds both a \emph{find} actor head and a \emph{push} actor head, plus a learned sigmoid gate supervised by \texttt{env.enable\_push} and a shared critic head.
+The combined logits are $\mathbf{l} = (1 - g)\,\mathbf{l}_\text{find} + g\,\mathbf{l}_\text{push}$ where $g$ is the gate output.
+
+Training used a 5-stage arena curriculum to ensure dense push-head gradients early:
+\begin{enumerate}[noitemsep]
+    \item 300~px arena, static box, 800 episodes
+    \item 400~px arena, static box, 1000 episodes
+    \item 500~px arena, static box, 1200 episodes
+    \item 500~px arena, static + walls, 1200 episodes
+    \item 500~px arena, blinking + walls, 1000 episodes
+    \item 500~px arena, moving + blinking + walls, 800 episodes
+\end{enumerate}
+
+
+\section{Experiments and Implementation Details}
+
+All training was done on a GPU-accelerated machine (CUDA).
+The PPO hyperparameters used across most variants are listed in Table~\ref{tab:hparams}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Hyperparameter & PPO (Phase~2) & EPB (Phase~3) \\
+\midrule
+Max steps/episode & 1000 & 600--1000 (curriculum) \\
+Rollout length & 512 & 512 \\
+Parallel environments & 8 & 8 \\
+Discount $\gamma$ & 0.99 & 0.99 \\
+GAE $\lambda$ & 0.95 & 0.95 \\
+PPO clip $\epsilon$ & 0.2 & 0.2 \\
+Entropy coefficient & 0.01 & 0.01 \\
+Value loss coefficient & 0.5 & 0.5 \\
+Learning rate & $3 \times 10^{-4}$ & $3 \times 10^{-4}$ \\
+Optimiser & Adam & Adam \\
+PPO epochs per update & 4 & 4 \\
+Mini-batch size & 256 & 256 \\
+Hidden layer size & 128 & 128 \\
+Observation dimension & 18 & 39 (belief-augmented) \\
+Gate auxiliary loss weight & -- & 0.5 \\
+Total episodes & 3000 & 6000 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters for the two main approaches.}
+\label{tab:hparams}
+\end{table}
+
+For the GRU-based agent (\texttt{ppo\_gru.py}), the find and push policies used the MLP backbone above; the unwedge policy used a GRU with hidden size 64, unrolled over the episode.
+The action set was $\{\text{L45}, \text{L22}, \text{FW}, \text{R22}, \text{R45}\}$ for all policies.
+
+Local evaluation used 10 independent seeds per checkpoint, matching the codabench protocol.
+Learning curves were monitored to detect overfitting to the curriculum stage and to decide when to advance to the next stage.
+
+
+\section{Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Model & Codabench Mean Score & Notes \\
+\midrule
+DDQN (template agent) & $-13{,}931$ & Phase~1 baseline, 3 runs, 200 steps \\
+PPO, raw obs (best) & $+539.9$ & Phase~2, no shaping, 10 runs \\
+PPO, shaped + encoded & $-111{,}868$ & Phase~2, shaping hurts badly \\
+PPO, Phase~2 final & $-238.6$ & Phase~2 submission \\
+Three-policy PPO & $-31{,}641$ & Phase~3, paper-inspired hierarchy \\
+Three-policy PPO (walls) & $-158{,}772$ & Phase~3, worst result \\
+Three-policy latent & $-114{,}049$ & Phase~3 variant \\
+GRU multi-head PPO & $+157.4$ & Phase~3 \textbf{best overall}, with walls \\
+\bottomrule
+\end{tabular}
+\caption{Summary of model performance. Scores are codabench mean reward (scaled $\times 5$, 1000 max steps, 10 runs unless noted).}
+\label{tab:results}
+\end{table}
+
+The GRU multi-head agent (\texttt{agent\_ppo\_gru\_un}) achieved the best codabench score of $+157.4$ on the walls variant of the development set.
+This corresponds to the agent successfully completing the full find-push-unwedge sequence in some fraction of runs.
+
+The most striking result of the project was the \emph{inverted performance} when reward shaping was introduced: the scored dropped from $+539.9$ to $-111{,}868$ on the exact same PPO architecture.
+This suggests that the shaped reward terms (sensor bonuses, stuck penalties) created local optima that trapped the agent away from the sparse terminal reward.
+
+
+\section{Error Analysis and Discussion}
+
+\paragraph{Level 1 (static box).}
+Even on the simplest level, the agent sometimes performs a prolonged spin without navigating toward the box, indicating that the find policy's exploration strategy is sub-optimal when the box is far from the starting position.
+The GRU agent mitigates this by maintaining directional memory, but can still lose the box direction after extended blank-sensor periods.
+
+\paragraph{Level 2 (blinking box).}
+When the box blinks (disappears for several steps), agents that rely on reactive sensors immediately lose track.
+The GRU's hidden state decays toward zero during blank steps -- the ``memory washout'' problem -- causing the agent to behave as if it has never seen the box.
+The EPB agent was designed to fix this by storing the last-visible direction in persistent fields, but due to time constraints this agent was not submitted to the final test phase.
+
+\paragraph{Level 3 (moving + blinking).}
+A moving box requires the agent to predict and intercept rather than follow.
+With only binary sonar readings and no velocity information, this is extremely difficult.
+The GRU agent partially compensates via temporal pattern matching in the hidden state, but fails when the box drifts far enough to escape all sensor cones between sightings.
+
+\paragraph{With walls.}
+Internal wall obstacles cause the robot to get stuck more frequently.
+The \texttt{STUCK} bit (bit~17) provides evidence of collision, but recovering from corner wedging requires backward-and-turn manoeuvres that are not explicitly rewarded.
+Interestingly, the GRU agent scored \emph{higher} on the walls variant ($+157.4$) than without walls ($-394.2$), suggesting that walls may sometimes help corral the box toward a boundary.
+
+\paragraph{Limitations and future work.}
+\begin{itemize}[noitemsep]
+    \item The EPB agent with the full 6-stage curriculum was not fully trained and evaluated on codabench before the deadline.
+    \item A recurrent state-space model (RSSM, \texttt{train\_ppo\_rssm.py}) was begun but not completed.
+    \item Hyperparameter search was largely manual; Bayesian optimisation could improve results significantly.
+    \item The three-policy architecture, inspired directly by the OBELIX paper, was surprisingly ineffective. A softer mixture-of-experts gating might be preferable to hard FSM switching.
+\end{itemize}
+
+
+\section{Conclusion}
+
+The main takeaway of this project is counter-intuitive: in a sparse-reward POMDP, \emph{less engineering is more}.
+Hand-crafted reward shaping and feature encoding consistently hurt performance, while raw PPO trained directly on the environment reward achieved scores three orders of magnitude better.
+This likely reflects reward hacking: the agent optimises the artificial shaped signal at the expense of the true objective.
+
+The best agent (GRU multi-head PPO, $+157.4$) demonstrates that memory is beneficial for this POMDP -- but the type of memory matters.
+Explicit, non-decaying belief states (EPB) are a principled alternative to GRU washout, and the architecture design appears sound; completing the training run is the primary remaining step.
+
+Future directions include: training with model-based RL (RSSM / Dreamer) to learn a latent world model from binary observations, applying curriculum learning more aggressively, and exploring soft gating (mixture of experts) rather than hard FSM phase detection.
+
+
+\section*{LLM Usage Declaration}
+\begin{itemize}
+\item \textbf{Which Large Language Model (LLM) did you use?} \\
+Claude (Anthropic) via Claude Code CLI.
+
+\item \textbf{In which part did you use the LLM, and how?}
+
+\begin{tabular}{l|l|p{6cm}}
+\toprule
+Part & Used LLM? & Purpose of Using LLM \\
+\midrule
+Understanding concepts & Yes & Clarifying PPO/POMDP concepts and GRU memory dynamics \\
+Ideation / brainstorming & Yes & Discussing EPB belief state design and curriculum structure \\
+Debugging small code snippets & Yes & Fixing shape mismatches and vectorised-env bugs \\
+Plotting / visualization code & No &   \\
+Grammar / writing style & Yes & Improving report prose and structure \\
+Report structure / section ideas & Yes & Drafting section outlines \\
+Other & Yes & Generating training scripts (\texttt{train\_ppo\_epb.py}, \texttt{compact\_belief.py}) \\
+\bottomrule
+\end{tabular}
+
+\item \textbf{Other sources consulted:} \\
+OBELIX competition paper~\cite{obelix}; Schulman et al.\ PPO paper~\cite{ppo}; Stable-Baselines3 documentation for PPO implementation reference.
+
+\item \textbf{Personal contribution:} \\
+The core experimental journey -- selecting which algorithms to try, recognising that shaped rewards hurt performance, designing the three-policy vs.\ single-agent ablation, devising the non-decaying EPB belief state, and running all training and evaluation -- was driven by the student.
+The LLM assisted with implementation and writing; all architectural decisions, observations, and conclusions are the student's own.
+\end{itemize}
+
+\vspace{2cm}
+
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+\end{document}

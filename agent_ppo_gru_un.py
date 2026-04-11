@@ -145,6 +145,7 @@ _unwedge_model.eval()
 
 _gru_hidden = _unwedge_model.zero_hidden()
 _push_grace = 0
+_ir_streak = 0          # consecutive steps IR has been active; threshold=2 before push_grace fires
 _unwedge_active = False
 _unwedge_grace = 0
 _post_unwedge_cooldown = 0
@@ -153,9 +154,10 @@ _prev_obs: np.ndarray | None = None
 
 
 def _reset_agent():
-    global _gru_hidden, _push_grace, _unwedge_active, _unwedge_grace, _post_unwedge_cooldown, _steps, _prev_obs
+    global _gru_hidden, _push_grace, _ir_streak, _unwedge_active, _unwedge_grace, _post_unwedge_cooldown, _steps, _prev_obs
     _gru_hidden = _unwedge_model.zero_hidden()
     _push_grace = 0
+    _ir_streak = 0
     _unwedge_active = False
     _unwedge_grace = 0
     _post_unwedge_cooldown = 0
@@ -169,14 +171,16 @@ def _maybe_reset(obs: np.ndarray):
         _prev_obs = obs.copy()
         return
 
-    if _steps >= MAX_EPISODE_STEPS or np.all(obs == 0):
+    # Only reset at episode boundary — never on blank obs (robot regularly
+    # sees nothing mid-episode; np.all(obs==0) was firing spuriously).
+    if _steps >= MAX_EPISODE_STEPS:
         _reset_agent()
         _prev_obs = obs.copy()
 
 
 @torch.no_grad()
 def policy(obs, rng=None):
-    global _gru_hidden, _push_grace, _unwedge_active, _unwedge_grace, _post_unwedge_cooldown, _steps, _prev_obs
+    global _gru_hidden, _push_grace, _ir_streak, _unwedge_active, _unwedge_grace, _post_unwedge_cooldown, _steps, _prev_obs
 
     raw = np.asarray(obs, dtype=np.float32)
     _maybe_reset(raw)
@@ -196,13 +200,16 @@ def policy(obs, rng=None):
     if _post_unwedge_cooldown > 0:
         _post_unwedge_cooldown -= 1
 
-    # Training used a reward-driven probe to confirm attachment, which is not
-    # available in submission. The closest observable fallback is IR-triggered
-    # push grace, while still respecting the post-unwedge cooldown.
+    # Require 2+ consecutive IR steps before entering push mode.
+    # A single-step IR flash from a wall contact should not trigger push grace.
     if ir_on and _post_unwedge_cooldown == 0:
-        _push_grace = PUSH_GRACE_STEPS
-    elif _push_grace > 0:
-        _push_grace -= 1
+        _ir_streak += 1
+        if _ir_streak >= 2:
+            _push_grace = PUSH_GRACE_STEPS
+    else:
+        _ir_streak = 0
+        if _push_grace > 0:
+            _push_grace -= 1
 
     if _unwedge_active:
         mode = "unwedge"
@@ -210,6 +217,14 @@ def policy(obs, rng=None):
         mode = "push"
     else:
         mode = "find"
+
+    # Hard rule: IR active and not stuck → always move forward.
+    # This guarantees attachment in ≤2 steps regardless of which network
+    # mode is active, matching the training reward probe behaviour.
+    if ir_on and not stuck_on:
+        _steps += 1
+        _prev_obs = raw.copy()
+        return "FW"
 
     if mode == "find":
         x = torch.from_numpy(get_find_obs(raw)).to(device).unsqueeze(0)

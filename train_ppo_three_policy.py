@@ -209,7 +209,11 @@ def ppo_update(
     if obs.shape[0] == 0:
         return {}
 
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    adv_std = advantages.std(unbiased=False)
+    if torch.isfinite(adv_std) and adv_std > 1e-8:
+        advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+    else:
+        advantages = advantages - advantages.mean()
     total = obs.shape[0]
 
     metrics = collections.defaultdict(list)
@@ -334,7 +338,25 @@ def main():
 
     ap.add_argument("--push_linger_steps", type=int, default=5)
     ap.add_argument("--unwedge_linger_steps", type=int, default=5)
+    ap.add_argument("--post_unwedge_cooldown_steps", type=int, default=10)
     ap.add_argument("--attach_reward_threshold", type=float, default=90.0)
+    ap.add_argument(
+        "--sticky_push",
+        action="store_true",
+        help="Latch push after attachment. Default follows ppo_gru_un-style push grace.",
+    )
+    ap.add_argument(
+        "--no_push_on_ir",
+        action="store_true",
+        help="Disable IR-rising-edge push activation; reward spike still activates push.",
+    )
+    ap.add_argument("--push_forward_bonus", type=float, default=3.0)
+    ap.add_argument("--push_else_penalty", type=float, default=3.0)
+    ap.add_argument("--unwedge_stuck_penalty", type=float, default=1.0)
+    ap.add_argument("--unwedge_stuck_penalty_cap", type=float, default=5.0)
+    ap.add_argument("--unwedge_escape_bonus", type=float, default=20.0)
+    ap.add_argument("--unwedge_escape_decay", type=float, default=1.5)
+    ap.add_argument("--no_subsumption_shaping", action="store_true")
     args = ap.parse_args()
 
     device = torch.device(args.device) if args.device else DEVICE
@@ -360,9 +382,10 @@ def main():
     manager_cfg = BehaviorManagerConfig(
         push_linger_steps=args.push_linger_steps,
         unwedge_linger_steps=args.unwedge_linger_steps,
+        post_unwedge_cooldown_steps=args.post_unwedge_cooldown_steps,
         attach_reward_threshold=args.attach_reward_threshold,
-        sticky_push=True,
-        activate_push_on_ir=True,
+        sticky_push=args.sticky_push,
+        activate_push_on_ir=not args.no_push_on_ir,
     )
     managers = [BehaviorManager(manager_cfg) for _ in range(args.n_envs)]
     anti_spin_cfg = AntiSpinPenaltyConfig(
@@ -417,6 +440,8 @@ def main():
 
     ep_ret = np.zeros(args.n_envs, dtype=np.float32)
     ep_steps = np.zeros(args.n_envs, dtype=np.int32)
+    box_attached = np.zeros(args.n_envs, dtype=bool)
+    unwedge_steps = np.zeros(args.n_envs, dtype=np.int32)
     behavior_steps = {behavior: 0 for behavior in BEHAVIORS}
     episodes_done = 0
     total_steps = 0
@@ -425,6 +450,7 @@ def main():
     window_returns: List[float] = []
     window_steps: List[int] = []
     window_anti_spin: List[float] = []
+    window_subsumption: List[float] = []
     success_count = 0
     recent_metrics = {
         behavior: collections.defaultdict(lambda: collections.deque(maxlen=20))
@@ -443,6 +469,12 @@ def main():
         f"difficulty={args.difficulty} wall={args.wall_obstacles} "
         f"repr={'state-encoder' if use_state_encoder else 'raw'} "
         f"anti_spin={'OFF' if args.no_anti_spin else 'find-only'}\n"
+    )
+    print(
+        f"[Three-Policy PPO] manager=push_grace({args.push_linger_steps}) "
+        f"sticky_push={args.sticky_push} push_on_ir={not args.no_push_on_ir} "
+        f"post_unwedge_cooldown={args.post_unwedge_cooldown_steps} "
+        f"subsumption_shaping={'OFF' if args.no_subsumption_shaping else 'ON'}\n"
     )
 
     pbar = tqdm(total=args.episodes, desc="Training", unit="ep", ncols=120)
@@ -491,6 +523,44 @@ def main():
                 next_obs_arr = np.asarray(next_raw_obs_list, dtype=np.float32)
 
             scaled_rewards = raw_rewards / args.reward_scale
+            subsumption_shaping = np.zeros(args.n_envs, dtype=np.float32)
+            if not args.no_subsumption_shaping:
+                for i, behavior in enumerate(current_behaviors):
+                    if raw_rewards[i] >= args.attach_reward_threshold:
+                        box_attached[i] = True
+
+                    if behavior == PUSH:
+                        good_push = (
+                            int(action_indices[i]) == ACTIONS.index("FW")
+                            and bool(raw_obs_list[i][16])
+                            and not bool(next_raw_obs_list[i][17])
+                            and box_attached[i]
+                        )
+                        if good_push:
+                            subsumption_shaping[i] += args.push_forward_bonus / args.reward_scale
+                        else:
+                            subsumption_shaping[i] -= args.push_else_penalty / args.reward_scale
+
+                    elif behavior == UNWEDGE:
+                        now_stuck = bool(next_raw_obs_list[i][17])
+                        unwedge_steps[i] += 1
+                        if now_stuck:
+                            penalty = min(
+                                args.unwedge_stuck_penalty * float(unwedge_steps[i]),
+                                args.unwedge_stuck_penalty_cap,
+                            )
+                            subsumption_shaping[i] -= penalty / args.reward_scale
+                        elif not now_stuck and not bool(next_raw_obs_list[i][16]):
+                            bonus = max(
+                                args.unwedge_escape_bonus
+                                - float(unwedge_steps[i]) * args.unwedge_escape_decay,
+                                args.unwedge_stuck_penalty_cap,
+                            )
+                            subsumption_shaping[i] += bonus / args.reward_scale
+                            unwedge_steps[i] = 0
+                    else:
+                        unwedge_steps[i] = 0
+
             anti_spin_penalties = np.zeros(args.n_envs, dtype=np.float32)
             if not args.no_anti_spin:
                 for i, behavior in enumerate(current_behaviors):
@@ -502,7 +572,7 @@ def main():
                         raw_reward=float(raw_rewards[i]),
                         attach_reward_threshold=args.attach_reward_threshold,
                     )
-            shaped_rewards = scaled_rewards + anti_spin_penalties
+            shaped_rewards = scaled_rewards + anti_spin_penalties + subsumption_shaping
 
             for i, behavior in enumerate(current_behaviors):
                 buffers[behavior].add_step(
@@ -517,13 +587,14 @@ def main():
             ep_ret += shaped_rewards
             ep_steps += 1
             window_anti_spin.extend(anti_spin_penalties.tolist())
+            window_subsumption.extend(subsumption_shaping.tolist())
             total_steps += args.n_envs
 
             for i, behavior in enumerate(current_behaviors):
                 if dones[i]:
                     buffers[behavior].close_segment(i, bootstrap_value=0.0)
 
-                    if raw_rewards[i] >= 100.0:
+                    if raw_rewards[i] >= 1000.0:
                         success_count += 1
 
                     window_returns.append(float(ep_ret[i]))
@@ -546,6 +617,8 @@ def main():
                     raw_obs_list[i] = reset_obs
                     managers[i].reset(reset_obs)
                     anti_spin_trackers[i].reset(reset_obs)
+                    box_attached[i] = False
+                    unwedge_steps[i] = 0
                     if use_state_encoder:
                         encoders[i].reset()
                         next_obs_arr[i] = encoders[i].encode(reset_obs)
@@ -635,6 +708,10 @@ def main():
                 tqdm.write(
                     f"│ Avg anti-spin penalty/step : {np.mean(window_anti_spin):8.4f}"
                 )
+            if window_subsumption:
+                tqdm.write(
+                    f"│ Avg subsumption shaping/step : {np.mean(window_subsumption):8.4f}"
+                )
             tqdm.write(
                 f"│ Behavior steps : find={behavior_steps[FIND]:,} push={behavior_steps[PUSH]:,} "
                 f"unwedge={behavior_steps[UNWEDGE]:,}   Updates : {update_count}"
@@ -655,6 +732,7 @@ def main():
             window_returns.clear()
             window_steps.clear()
             window_anti_spin.clear()
+            window_subsumption.clear()
 
     pbar.close()
     vec.close()
