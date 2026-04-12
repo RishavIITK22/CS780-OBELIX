@@ -1,408 +1,400 @@
 \documentclass[11pt, oneside]{article}
-\usepackage[margin=1in]{geometry}
+\usepackage[margin=0.8in]{geometry}
+\geometry{letterpaper}
 \usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{float}
 \usepackage{caption}
 \usepackage{subcaption}
 \usepackage[numbers]{natbib}
-\usepackage{graphicx}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{array}
-\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, backgrounds}
 
-\title{CS780 Capstone Project:\\
-OBELIX: the Warehouse Robot}
+\setlist[itemize]{leftmargin=*, itemsep=0.2em}
+\setlist[enumerate]{leftmargin=*, itemsep=0.2em}
 
+\title{CS780 Capstone Project: OBELIX: the Warehouse Robot}
 \author{
     FirstName $<$Middle Name if any$>$ LastName  \\
     roll no.\\
-   {\tt \{name\}@iitk.ac.in}\\
-{Indian Institute of Technology Kanpur (IIT Kanpur)}
+    {\tt \{name\}@iitk.ac.in}\\
+    Indian Institute of Technology Kanpur (IIT Kanpur)
 }
-
 \date{}
 
 \begin{document}
-
 \maketitle
 
 \begin{abstract}
-We tackle OBELIX, a warehouse robot POMDP task where an agent must find, attach to, push, and unwedge a grey box to the arena boundary using only binary sonar and IR sensors.
-We explored Double DQN, vanilla PPO, PPO with frame stacking, PPO with LSTM, a three-policy hierarchical architecture, GRU-based multi-head PPO, and a final Explicit Phase Belief (EPB) agent that replaces recurrent memory with a hand-crafted non-decaying 16-dimensional belief state.
-A key finding was that reward shaping and encoded observations hurt performance compared to raw reward PPO.
-The best codabench score of $+157.4$ was achieved by the GRU-based agent trained without reward shaping.
+I studied the OBELIX box-pushing task as a partially observable control problem with three latent behaviours: find, push, and unwedge. The development path moved from a Double-DQN baseline to PPO with hand-crafted belief states, then to paper-inspired modular policies. The best model was a three-policy recurrent PPO controller: GRU policies for finding and pushing, and an LSTM policy for unwedging, all using raw 18-bit observations and light behaviour-specific shaping.
 \end{abstract}
-
 
 \section{Competition Result}
 \textbf{Codabench Username:} \_\_\_\_\_\_\_\_\_\_\_ \\
 \textbf{Final leaderboard rank (Test Phase):} \_\_\_\_\_\_\_\_\_\_\_ \\
 \textbf{Leaderboard rank -- Level 1 (static):} \_\_\_\_\_\_\_\_\_\_\_ \\
 \textbf{Leaderboard rank -- Level 2 (blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
-\textbf{Leaderboard rank -- Level 3 (moving + blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
-
-\vspace{0.5em}
-\textbf{Number of valid submissions (Development and Test):}
+\textbf{Leaderboard rank -- Level 3 (moving + blinking):} \_\_\_\_\_\_\_\_\_\_\_
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lcccc}
+\caption{Submission summary. The reward fields are left explicit so I can paste final Codabench values.}
+\begin{tabular}{p{0.14\linewidth}p{0.15\linewidth}p{0.48\linewidth}p{0.15\linewidth}}
 \toprule
-Phase & Agent & Mean Score & Std & Runs \\
+Phase & Difficulty & Main submission family & Mean reward \\
 \midrule
-Dev (Feb 11) & agent\_template & $-13931.0$ & $8342.4$ & 3 \\
-Dev (Feb 11) & agent\_template & $-16100.7$ & $10503.0$ & 3 \\
-Dev (Mar 22) & agent (PPO, raw obs) & $+229.9$ & $1506.3$ & 10 \\
-Dev (Mar 22) & agent (PPO, raw obs) & $+539.9$ & $1539.9$ & 10 \\
-Dev (Mar 22) & agent (PPO, raw obs) & $+537.2$ & $1537.2$ & 10 \\
-Dev (Mar 22) & agent (PPO, shaped) & $-111868.2$ & $93154.5$ & 10 \\
-Dev (Mar 22) & agent (PPO, shaped+walls) & $-136026.6$ & $90449.6$ & 10 \\
-Dev (Mar 29) & agent (Phase 2 final) & $-238.6$ & $2300.1$ & 10 \\
-Dev (Apr 5) & agent\_three\_policy & $-31641.8$ & $67989.9$ & 10 \\
-Dev (Apr 7) & agent\_three\_policy & $-73666.1$ & $92732.4$ & 10 \\
-Dev (Apr 7) & agent\_three\_policy (walls) & $-158772.2$ & $73982.4$ & 10 \\
-Dev (Apr 7) & agent\_three\_policy\_latent & $-114049.1$ & $94840.9$ & 10 \\
-Dev (Apr 10) & agent\_ppo\_gru\_un & $-394.2$ & $4092.0$ & 10 \\
-Dev (Apr 10) & agent\_ppo\_gru\_un (walls) & $+157.4$ & $1398.6$ & 10 \\
+Phase 1 & 0 & Double DQN baseline, 4 submissions & \_\_\_\_ \\
+Phase 2 & 2 & PPO frame stacking / PPO LSTM, 2 submissions & $\mathcal{O}(-10^5)$ to \_\_\_\_ \\
+Phase 3 & 3 & Three-policy PPO ablations & \_\_\_\_ \\
+Final & 0, 2, 3 & Latent PPO, EPB, hybrid DDQN, recurrent three-policy PPO & best: \_\_\_\_ \\
 \bottomrule
 \end{tabular}
-\caption{All development submissions. Scores reported by codabench (scaling factor $\times 5$, 1000 max steps).}
-\label{tab:submissions}
 \end{table}
-
 
 \section{Introduction and Problem Description}
+OBELIX is a simulated warehouse robot that must find a grey box, attach to it, push it to the arena boundary, and then recover from wedged states. The action set is discrete:
+\[
+\mathcal{A}=\{\text{L45},\text{L22},\text{FW},\text{R22},\text{R45}\}.
+\]
+The observation is an 18-bit vector: 16 sonar bits from near/far bins around the robot, one infrared contact bit, and one stuck bit. The conceptual task order is
+\[
+\text{find}\rightarrow \text{attach}\rightarrow \text{push}\rightarrow \text{unwedge},
+\]
+but this phase is not directly given to the agent.
 
-OBELIX is a simulated warehouse robot task that requires an autonomous agent to navigate a 2D arena, locate a grey box, attach to it by approaching head-on, push the box to any boundary wall, and handle cases where the box becomes wedged in a corner (the ``unwedge'' phase).
-The challenge is designed to be a realistic Partially Observable Markov Decision Process (POMDP): the robot has \emph{no global position or orientation}, and can only observe 18 binary sensor bits: 4 left sonar readings (near/far $\times$ 2 beams), 8 front sonar readings (near/far $\times$ 4 beams), 4 right sonar readings (near/far $\times$ 2 beams), one IR proximity sensor (object at $<4$~inches), and one stuck flag (motor current exceeded threshold).
+The benchmark has three increasing difficulty levels: a static box, a blinking box, and a moving plus blinking box. Wall obstacles add a narrow-passage navigation problem and make false push/unwedge decisions costly. The problem is a POMDP: blank sonar frames do not imply that the box is absent, the IR bit is not a persistent attachment flag, and the same 18-bit observation can require different actions depending on recent contacts. The goal was therefore not just high local reward, but robustness across hidden seeds, blinking, motion, and walls.
 
-The task unfolds in three difficulty levels:
-\begin{itemize}[noitemsep]
-    \item \textbf{Level 1 (static):} The box remains stationary. The robot must find and push it to a wall.
-    \item \textbf{Level 2 (blinking):} The box periodically disappears and reappears. Sensors may return false negatives, breaking naive reactive strategies.
-    \item \textbf{Level 3 (moving + blinking):} The box drifts autonomously in addition to blinking, making prediction and interception necessary.
-\end{itemize}
-An optional wall-obstacle variant places internal walls in the arena, requiring collision-aware navigation.
-
-The POMDP nature makes this problem hard: the box may be invisible for hundreds of consecutive steps, the robot cannot localise itself, the phase transitions (find $\to$ push $\to$ unwedge) must be inferred purely from sensor evidence, and exploration is structureless without any global map.
-The objective is to maximise mean cumulative reward (per episode, scaled by 5) across all difficulties, with a maximum of 1000 steps per episode.
-
+I treated the hidden state as
+\[
+s_t=(x_t^{\mathrm{bot}},y_t^{\mathrm{bot}},\theta_t^{\mathrm{bot}},
+x_t^{\mathrm{box}},y_t^{\mathrm{box}},v_t^{\mathrm{box}},
+\text{visibility}_t,\text{attachment}_t,\text{wall contacts}_t),
+\]
+while the policy only receives \(o_t\in\{0,1\}^{18}\). This mismatch is important: two episodes can have the same \(o_t=\mathbf{0}\), but in one episode the box was last seen to the left and in another it was last seen to the right. A memoryless policy must map both to the same action, whereas a recurrent policy can condition on the observation history \(h_t=(o_0,a_0,\ldots,o_t)\).
 
 \section{Approach and Model Evolution}
+\subsection*{Phase 1: Double-DQN Baseline}
+The first phase targeted difficulty 0. I implemented a Double-DQN baseline in \texttt{train\_ddqn.py}, with a two-layer MLP \(18\!\to\!64\!\to\!64\!\to\!5\), replay buffer, target network, and \(\epsilon\)-greedy exploration \citep{mnih2015dqn,vanhasselt2016double}. The Bellman target was
+\[
+y_t=r_t+\gamma Q_{\theta^-}(s_{t+1},\arg\max_a Q_{\theta}(s_{t+1},a)).
+\]
+I also implemented \texttt{vec\_env.py} to run multiple OBELIX environments in parallel through subprocesses. This improved data throughput and made it easier to compare reward shaping variants. Reward shaping at this stage was intentionally minimal: reward scaling, a small living cost, and the environment reward signal.
 
-\subsection{Phase 1: Double DQN Baseline}
+This baseline was useful because it established two facts early. First, parallel sampling was necessary; single-environment training produced noisy curves and slow iteration. Second, value bootstrapping alone did not solve the long-horizon credit assignment problem. The replay buffer contained many blank-observation transitions and only a few terminal-success transitions, so the learned \(Q\)-values often preferred short spinning patterns over risky forward exploration.
 
-\paragraph{POMDP formulation.}
-OBELIX is formally a POMDP $\langle \mathcal{S}, \mathcal{A}, \mathcal{O}, T, \Omega, R, \gamma \rangle$.
-The true state $s_t \in \mathcal{S}$ includes robot pose, box position, and phase; only observation $o_t \in \{0,1\}^{18}$ is accessible.
-The agent must maximise $\mathbb{E}\bigl[\sum_{t=0}^{T} \gamma^t r_t\bigr]$ with $\gamma = 0.99$.
+\subsection*{Phase 2: Monolithic PPO with Belief Features}
+For difficulty 2, I moved to PPO because the blinking box made off-policy value learning brittle \citep{schulman2017ppo}. The first PPO variants used \texttt{state\_encoder.py} and \texttt{reward\_shaper.py}. The encoder built a stacked belief vector from raw bits, sector strengths, direction summaries, temporal counters, transition cues, and the previous action. The shaper rewarded front/side evidence during finding, forward progress during pushing, and recovery from stuck states.
 
-\paragraph{Algorithm.}
-The starting point was a Double DQN (DDQN) agent.
-DQN approximates the action-value function $Q^*(s,a) = \max_\pi \mathbb{E}\bigl[\sum_{t} \gamma^t r_t \mid s_0{=}s, a_0{=}a\bigr]$ with a neural network $Q(o;\theta)$.
-DDQN decouples action \emph{selection} from action \emph{evaluation} to reduce maximisation bias:
-\begin{equation}
-  y_t = r_t + \gamma\, Q\!\bigl(o_{t+1},\,\arg\max_{a'} Q(o_{t+1},a';\theta);\,\theta^{-}\bigr),
-  \label{eq:ddqn}
-\end{equation}
-where $\theta^{-}$ is a periodically-copied target network.
-The network was a three-layer MLP ($18 \to 64 \to 64 \to 5$) with $\epsilon$-greedy exploration; the loss was
-$\mathcal{L}(\theta) = \mathbb{E}\bigl[(y_t - Q(o_t, a_t; \theta))^2\bigr]$.
+The PPO objective was the clipped surrogate
+\[
+L^{\mathrm{CLIP}}(\theta)=
+\mathbb{E}_t\left[
+\min\left(\rho_t A_t,\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)A_t\right)
+\right],
+\quad
+\rho_t=\frac{\pi_\theta(a_t|o_t)}{\pi_{\theta_{\mathrm{old}}}(a_t|o_t)}.
+\]
+I submitted PPO frame stacking and PPO LSTM variants \citep{hochreiter1997lstm}. Locally, the agent sometimes completed episodes, but Codabench rewards were on the order of \(-10^5\). Removing the handcrafted encoder and most shaping improved robustness. The raw-observation variants still spun frequently, solved only occasionally, and were weak near walls.
 
-\paragraph{Infrastructure built.}
-A vectorised environment (\texttt{vec\_env.py}) ran $N$ OBELIX instances in parallel subprocesses.
-A \texttt{RewardShaper} (\texttt{reward\_shaper.py}) defined a shaped reward
-\begin{equation}
-  \tilde{r}_t = r_t + F(o_t, a_t),
-  \label{eq:shaping}
-\end{equation}
-with sensor-evidence bonuses (find phase), a forward-progress bonus (push), and an escalating stuck penalty.
-A \texttt{BeliefStateEncoder} (\texttt{state\_encoder.py}) expanded $o_t \in \{0,1\}^{18}$ into a 49-dimensional frame with sector strengths, direction summaries, and temporal-memory flags.
+The main lesson of Phase 2 was that local visual success was not a sufficient criterion. The frame-stacked policy could exploit stable local rollouts, but hidden evaluation seeds changed the distribution of blank intervals and wall contacts. The LSTM variant had a better information structure than frame stacking, but a single monolithic policy still had to learn three qualitatively different behaviours from one reward stream.
 
-\paragraph{Failure.}
-DDQN with $\tilde{r}_t$ and encoded observations scored $-13{,}931$ on codabench.
-Two factors contributed.
-First, DDQN's off-policy replay is well-suited to dense-reward tasks; the OBELIX reward is sparse and highly delayed (success bonus only at episode end), making the bootstrapped TD target $y_t$ (Eq.~\ref{eq:ddqn}) extremely noisy early in training.
-Second, the shaping term $F$ was not potential-based ($F \neq \gamma\Phi(o') - \Phi(o)$), so it changed the optimal policy~\cite{ng1999policy}: the agent learned to exploit sensor bonuses without completing the task.
+\subsection*{Phase 3: Paper-Inspired Three-Policy PPO}
+The original OBELIX paper uses a behaviour-based decomposition where unwedging suppresses pushing, and pushing suppresses finding \citep{mahadevan1991obelix}. I replicated this idea in \texttt{train\_ppo\_three\_policy.py}: three independent PPO policies, a fixed behaviour manager, and priority
+\[
+\text{unwedge} \succ \text{push} \succ \text{find}.
+\]
+I tried the belief encoder and then raw observations, with minimal shaping and a find-only anti-spinning penalty from \texttt{anti\_spin\_penalty.py}. The modular design was conceptually cleaner, but the actual performance remained poor. The find policy still found spinning attractors, and walls produced many stale IR or stuck transitions that confused the push/unwedge switch.
 
-\subsection{Phase 2: PPO and the Surprising Benefit of Simplicity}
+The failure was not that the hierarchy was wrong; it was that each module was still too reactive. If the find module received a blank observation after seeing the box, it had no internal record of the last useful direction. If the push module saw IR flicker, it could drop contact too early. If the unwedge module saw repeated stuck frames, it could learn a symmetric turn policy that did not distinguish which direction would clear the wall.
 
-\paragraph{Algorithm.}
-Proximal Policy Optimisation (PPO)~\cite{ppo} directly optimises the policy $\pi_\theta(a \mid o)$ using the clipped surrogate objective:
-\begin{equation}
-  \mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[\min\!\left(\rho_t(\theta)\,\hat{A}_t,\;\operatorname{clip}\!\left(\rho_t(\theta), 1{-}\varepsilon, 1{+}\varepsilon\right)\hat{A}_t\right)\right],
-  \label{eq:ppo}
-\end{equation}
-where $\rho_t(\theta) = \pi_\theta(a_t \mid o_t)/\pi_{\theta_{\text{old}}}(a_t \mid o_t)$ is the importance ratio and $\hat{A}_t$ is the Generalised Advantage Estimate (GAE):
-\begin{equation}
-  \hat{A}_t = \sum_{\ell=0}^{T-t-1}(\gamma\lambda)^\ell \delta_{t+\ell}, \qquad \delta_t = r_t + \gamma V_\theta(o_{t+1}) - V_\theta(o_t).
-  \label{eq:gae}
-\end{equation}
-The full PPO loss is
-$\mathcal{L} = -\mathcal{L}^{\text{CLIP}} + c_v \mathcal{L}^{\text{VF}} - c_e \mathcal{H}[\pi_\theta]$,
-where $\mathcal{L}^{\text{VF}} = \mathbb{E}_t[(V_\theta(o_t)-V^{\text{target}}_t)^2]$ and $\mathcal{H}$ is the policy entropy (exploration regulariser).
-A shared-trunk MLP actor-critic was used: $f_\theta: \mathbb{R}^{18} \to \mathbb{R}^{128}$ (two Tanh layers), $\pi_\theta(\cdot \mid o) = \operatorname{softmax}(W_a f_\theta(o))$, $V_\theta(o) = w_v^\top f_\theta(o)$.
+\subsection*{Final Phase: Recurrent Three-Policy PPO}
+I then extended the three-policy idea through several experiments. The goal of this phase was to keep the useful behaviour decomposition, but fix two recurring problems: blank-observation memory loss and unreliable phase switching.
 
-\paragraph{Key finding: shaping is harmful.}
-Raw PPO (no shaping, raw 18-bit obs) scored $+539.9$; the identical architecture with $\tilde{r}_t$ and encoded observations scored $-111{,}868$.
-The mechanism: $F$ in Eq.~\ref{eq:shaping} provides dense per-step signal, so the PPO advantage estimate (Eq.~\ref{eq:gae}) is dominated by $F$-shaped values.
-The policy gradient points toward maximising $\sum F$ rather than $\sum r$, pushing the agent into a local optimum of circling near sensor fields without completing the task.
+\begin{itemize}
+    \item \textbf{Latent three-policy PPO.} In \texttt{train\_ppo\_three\_policy\_latent.py}, I tried replacing hand-coded observation summaries with learned recurrent latent beliefs. Each behaviour had a recurrent actor-critic similar to
+    \[
+    z_t=f_\phi(o_t),\qquad h_t^b=\mathrm{LSTM}_b([z_t,a_{t-1},r_{t-1},d_{t-1}],h_{t-1}^b),
+    \]
+    and the policy was \(\pi_b(a_t|h_t^b)\). I also experimented with curiosity for the find phase, using prediction errors such as
+    \[
+    r_t^{\mathrm{int}}\propto \left\|\hat{z}_{t+1}-z_{t+1}\right\|_2^2,
+    \qquad
+    r_t^{\mathrm{train}}=r_t^{\mathrm{env}}+\eta r_t^{\mathrm{int}}.
+    \]
+    The motivation was that the find policy needed exploration when all sensors were blank. In practice this performed poorly, about \(-2\times10^5\) on Codabench. The intrinsic reward made exploration broader, but it also rewarded novelty unrelated to pushing the box out, and the recurrent latent state was hard to train with sparse terminal success.
 
-\paragraph{Frame stacking.}
-To partially address partial observability, $k$ consecutive frames were concatenated:
-$\bar{o}_t = [o_{t-k+1}, \ldots, o_t] \in \{0,1\}^{18k}$,
-approximating the history-conditioned policy $\pi(a_t \mid h_t) \approx \pi(a_t \mid \bar{o}_t)$.
-This is a $k$-Markov approximation and fails when the box is invisible for $> k$ steps -- common in Levels~2 and~3.
-Results on codabench did not clearly improve over the single-frame baseline.
+    \item \textbf{Explicit Phase Belief (EPB).} In \texttt{train\_ppo\_epb.py}, I moved in the opposite direction: instead of asking an RNN to discover all memory, I built a compact persistent belief \(b_t\). The key update was non-decaying memory:
+    \[
+    d_t=
+    \begin{cases}
+    \phi(o_t), & \text{if any box sensor/IR evidence is visible},\\
+    d_{t-1}, & \text{if }o_t\text{ is blank},
+    \end{cases}
+    \]
+    where \(d_t\) stores last useful direction/contact evidence. The policy input was \(x_t=[o_t,b_t,\phi_{\mathrm{FSM}}(o_t,b_t)]\). I used a dual-head actor-critic with a soft gate:
+    \[
+    g_t=\sigma(w_g^\top f_\theta(x_t)),\qquad
+    \ell_t=(1-g_t)\ell_t^{\mathrm{find}}+g_t\ell_t^{\mathrm{push}},
+    \]
+    plus a gate loss \(\mathcal{L}_{\mathrm{gate}}=\operatorname{BCE}(g_t,\texttt{enable\_push}_t)\) during training. The motivation was to prevent GRU-style memory washout over hundreds of blank steps and to make phase switching differentiable. This improved to roughly \(-1.5\times10^4\), but the hand-coded belief still made mistakes near walls and could overcommit to stale direction estimates.
 
-\paragraph{LSTM.}
-An LSTM-augmented policy addressed the $k$-Markov limitation by maintaining a hidden state $h_t$ across the full episode:
-\begin{equation}
-  (h_t, c_t) = \operatorname{LSTM}(o_t,\, h_{t-1},\, c_{t-1}), \qquad \pi_\theta(a_t \mid h_t).
-\end{equation}
-Training used truncated BPTT over windows of length $T_{\text{bptt}}=512$.
-In practice, LSTM gradients decay as $\prod_{\tau} \partial h_{\tau+1}/\partial h_\tau$; older time steps ($>$50--100 steps back) contributed negligible gradient, so the agent still could not reliably retain box direction across blank periods of $200{+}$ steps.
-Combined with the shaped reward it produced even worse results, ending Phase~2 with a final submission of $-238.6$.
-
-\subsection{Phase 3: Three-Policy Architecture and GRU Recovery}
-
-\paragraph{Three-policy hierarchy.}
-Motivated by the OBELIX paper~\cite{obelix}, Phase~3 implemented a behaviour-decomposed architecture with priority ordering:
-\begin{equation}
-  b_t = \begin{cases} \texttt{unwedge} & \text{if } \texttt{STUCK} \wedge \texttt{IR} \\ \texttt{push} & \text{if } \texttt{IR} \\ \texttt{find} & \text{otherwise} \end{cases}
-  \label{eq:fsm}
-\end{equation}
-Three independent PPO actor-critic networks $\{\pi^b_\theta\}_{b \in \{\texttt{find},\texttt{push},\texttt{unwedge}\}}$ were trained.
-The gradient update for policy $b$ only uses timesteps where $b_t = b$:
-\begin{equation}
-  \nabla_\theta \mathcal{L}^b = \mathbb{E}_t\!\left[\mathbf{1}[b_t = b]\cdot \nabla_\theta \log \pi^b_\theta(a_t \mid o_t)\cdot \hat{A}_t\right].
-\end{equation}
-
-\paragraph{Failure analysis.}
-The FSM selector (Eq.~\ref{eq:fsm}) relies on clean sensor readings.
-During blinking (Level~2) and while pushing (where \texttt{IR} can flicker), $b_t$ mis-classified frequently, so the push policy received gradients from find-phase timesteps and vice versa -- a form of \emph{policy interference}.
-Additionally, $\mathbf{1}[b_t = b]$ masks out the majority of timesteps for each head, starving the gradient signal.
-Scores ranged from $-31{,}641$ to $-158{,}772$.
-
-\paragraph{GRU multi-head PPO.}
-Replacing hard phase-switching with a unified recurrent agent (\texttt{ppo\_gru.py}):
-\begin{align}
-  h_t &= \underbrace{(1 - z_t) \odot h_{t-1}}_{\text{retain}} + \underbrace{z_t \odot \tilde{n}_t}_{\text{update}}, \label{eq:gru} \\
-  z_t &= \sigma\!\left(W_z [h_{t-1};\, o_t] + b_z\right), \quad
-  r_t = \sigma\!\left(W_r [h_{t-1};\, o_t] + b_r\right), \quad
-  \tilde{n}_t = \tanh\!\left(W_n [r_t \odot h_{t-1};\, o_t] + b_n\right). \notag
-\end{align}
-The find/push MLP and GRU-based unwedge head shared training data without any masking.
-All reward shaping was removed.
-This yielded scores of $-394.2$ (no walls) and $+157.4$ (with walls) -- the best results of the project.
-
-\paragraph{GRU washout (identified failure mode).}
-During blank sensor steps, the update gate $z_t \approx \sigma(b_z)$ is small (no informative input), so from Eq.~\ref{eq:gru}:
-\begin{equation}
-  \|h_{t+T}\| \approx (1 - \bar{z})^T \|h_t\| \xrightarrow{T \to \infty} 0,
-  \label{eq:washout}
-\end{equation}
-where $\bar{z}$ is the mean update-gate activation.
-After $T \sim 200$ blank steps the hidden state approaches zero, erasing the last-known box direction.
-This is the primary failure mode on Level~2 and Level~3.
-
-\subsection{EPB: Explicit Phase Belief Agent (Final Approach)}
-
-\paragraph{Motivation.}
-The GRU washout (Eq.~\ref{eq:washout}) is intrinsic to any recurrent unit with bounded activations.
-The EPB agent replaces learned recurrence with an \emph{explicit, non-decaying belief state} $b_t \in \mathbb{R}^{16}$ (\texttt{compact\_belief.py}).
-
-\paragraph{Belief update rule.}
-Unlike a GRU, the last-visible direction fields update only when a sensor fires and never decay:
-\begin{equation}
-  d_t^{\text{dir}} =
-  \begin{cases}
-    \phi^{\text{dir}}(o_t) & \text{if } \textstyle\sum_i o_t^{(i)} > 0 \quad \text{(sensor active)} \\
-    d_{t-1}^{\text{dir}} & \text{otherwise}
-  \end{cases}
-  \label{eq:belief_update}
-\end{equation}
-for direction $\text{dir} \in \{\text{left}, \text{front}, \text{right}, \text{IR}\}$, where $\phi^{\text{dir}}$ aggregates the relevant sonar bits.
-A staleness counter $\tau_t = \min(\tau_{t-1} + \mathbf{1}[\text{blank}],\, 500)$ and phase latch $\texttt{attached}_t = \texttt{attached}_{t-1} \vee \mathbf{1}[\text{IR active for} \ge 2\text{ steps}]$ complete the 16-dim state.
-
-\paragraph{Network.}
-The 39-dimensional policy input is:
-\begin{equation}
-  x_t = [\,\underbrace{o_t}_{18}\;\|\;\underbrace{b_t}_{16}\;\|\;\underbrace{\phi^{\text{FSM}}(o_t, b_t)}_{5}\,],
-  \label{eq:epb_input}
-\end{equation}
-where $\phi^{\text{FSM}}$ is a one-hot encoding of the reactive FSM action suggestion (orient toward last-seen direction, spin if blind, push if attached) used as a soft prior.
-
-A \textbf{dual-head actor-critic} with a learned soft gate replaces the hard FSM selector:
-\begin{equation}
-  \mathbf{l}_t = (1 - g_t)\,\mathbf{l}^{\text{find}}_t + g_t\,\mathbf{l}^{\text{push}}_t, \qquad
-  g_t = \sigma\!\left(w_g^\top f_\theta(x_t)\right),
-  \label{eq:gate}
-\end{equation}
-with $f_\theta: \mathbb{R}^{39} \to \mathbb{R}^{128}$ (two Tanh layers).
-The gate is supervised by a binary cross-entropy auxiliary loss:
-\begin{equation}
-  \mathcal{L}^{\text{gate}} = -\bigl[\hat{g}_t \log g_t + (1-\hat{g}_t)\log(1-g_t)\bigr], \quad \hat{g}_t = \texttt{env.enable\_push},
-\end{equation}
-added to the PPO objective with weight $c_g = 0.5$.
-This soft gating is continuous and differentiable, resolving the policy-interference problem of the hard FSM.
-
-\paragraph{Curriculum.}
-Training used a 6-stage arena curriculum to ensure dense push-head gradients from the start (small arena $\Rightarrow$ box found quickly $\Rightarrow$ gate and push head receive signal early):
-\begin{enumerate}[noitemsep]
-    \item 300~px arena, static box, 800 episodes
-    \item 400~px arena, static box, 1000 episodes
-    \item 500~px arena, static box, 1200 episodes
-    \item 500~px arena, static + walls, 1200 episodes
-    \item 500~px arena, blinking + walls, 1000 episodes
-    \item 500~px arena, moving + blinking + walls, 800 episodes
-\end{enumerate}
-
-
-\section{Experiments and Implementation Details}
-
-All training was done on a GPU-accelerated machine (CUDA).
-The PPO hyperparameters used across most variants are listed in Table~\ref{tab:hparams}.
-
-\begin{table}[H]
-\centering
-\begin{tabular}{lcc}
-\toprule
-Hyperparameter & PPO (Phase~2) & EPB (Phase~3) \\
-\midrule
-Max steps/episode & 1000 & 600--1000 (curriculum) \\
-Rollout length & 512 & 512 \\
-Parallel environments & 8 & 8 \\
-Discount $\gamma$ & 0.99 & 0.99 \\
-GAE $\lambda$ & 0.95 & 0.95 \\
-PPO clip $\epsilon$ & 0.2 & 0.2 \\
-Entropy coefficient & 0.01 & 0.01 \\
-Value loss coefficient & 0.5 & 0.5 \\
-Learning rate & $3 \times 10^{-4}$ & $3 \times 10^{-4}$ \\
-Optimiser & Adam & Adam \\
-PPO epochs per update & 4 & 4 \\
-Mini-batch size & 256 & 256 \\
-Hidden layer size & 128 & 128 \\
-Observation dimension & 18 & 39 (belief-augmented) \\
-Gate auxiliary loss weight & -- & 0.5 \\
-Total episodes & 3000 & 6000 \\
-\bottomrule
-\end{tabular}
-\caption{Hyperparameters for the two main approaches.}
-\label{tab:hparams}
-\end{table}
-
-For the GRU-based agent (\texttt{ppo\_gru.py}), the find and push policies used the MLP backbone above; the unwedge policy used a GRU with hidden size 64, unrolled over the episode.
-The action set was $\{\text{L45}, \text{L22}, \text{FW}, \text{R22}, \text{R45}\}$ for all policies.
-
-Local evaluation used 10 independent seeds per checkpoint, matching the codabench protocol.
-Learning curves were monitored to detect overfitting to the curriculum stage and to decide when to advance to the next stage.
-
-
-\section{Results}
-
-\begin{table}[H]
-\centering
-\begin{tabular}{lcc}
-\toprule
-Model & Codabench Mean Score & Notes \\
-\midrule
-DDQN (template agent) & $-13{,}931$ & Phase~1 baseline, 3 runs, 200 steps \\
-PPO, raw obs (best) & $+539.9$ & Phase~2, no shaping, 10 runs \\
-PPO, shaped + encoded & $-111{,}868$ & Phase~2, shaping hurts badly \\
-PPO, Phase~2 final & $-238.6$ & Phase~2 submission \\
-Three-policy PPO & $-31{,}641$ & Phase~3, paper-inspired hierarchy \\
-Three-policy PPO (walls) & $-158{,}772$ & Phase~3, worst result \\
-Three-policy latent & $-114{,}049$ & Phase~3 variant \\
-GRU multi-head PPO & $+157.4$ & Phase~3 \textbf{best overall}, with walls \\
-\bottomrule
-\end{tabular}
-\caption{Summary of model performance. Scores are codabench mean reward (scaled $\times 5$, 1000 max steps, 10 runs unless noted).}
-\label{tab:results}
-\end{table}
-
-The GRU multi-head agent (\texttt{agent\_ppo\_gru\_un}) achieved the best codabench score of $+157.4$ on the walls variant of the development set.
-This corresponds to the agent successfully completing the full find-push-unwedge sequence in some fraction of runs.
-
-The most striking result of the project was the \emph{inverted performance} when reward shaping was introduced: the scored dropped from $+539.9$ to $-111{,}868$ on the exact same PPO architecture.
-This suggests that the shaped reward terms (sensor bonuses, stuck penalties) created local optima that trapped the agent away from the sparse terminal reward.
-
-
-\section{Error Analysis and Discussion}
-
-\paragraph{Level 1 (static box).}
-Even on the simplest level, the agent sometimes performs a prolonged spin without navigating toward the box, indicating that the find policy's exploration strategy is sub-optimal when the box is far from the starting position.
-The GRU agent mitigates this by maintaining directional memory, but can still lose the box direction after extended blank-sensor periods.
-
-\paragraph{Level 2 (blinking box).}
-When the box blinks (disappears for several steps), agents that rely on reactive sensors immediately lose track.
-The GRU's hidden state decays toward zero during blank steps -- the ``memory washout'' problem -- causing the agent to behave as if it has never seen the box.
-The EPB agent was designed to fix this by storing the last-visible direction in persistent fields, but due to time constraints this agent was not submitted to the final test phase.
-
-\paragraph{Level 3 (moving + blinking).}
-A moving box requires the agent to predict and intercept rather than follow.
-With only binary sonar readings and no velocity information, this is extremely difficult.
-The GRU agent partially compensates via temporal pattern matching in the hidden state, but fails when the box drifts far enough to escape all sensor cones between sightings.
-
-\paragraph{With walls.}
-Internal wall obstacles cause the robot to get stuck more frequently.
-The \texttt{STUCK} bit (bit~17) provides evidence of collision, but recovering from corner wedging requires backward-and-turn manoeuvres that are not explicitly rewarded.
-Interestingly, the GRU agent scored \emph{higher} on the walls variant ($+157.4$) than without walls ($-394.2$), suggesting that walls may sometimes help corral the box toward a boundary.
-
-\paragraph{Limitations and future work.}
-\begin{itemize}[noitemsep]
-    \item The EPB agent with the full 6-stage curriculum was not fully trained and evaluated on codabench before the deadline.
-    \item A recurrent state-space model (RSSM, \texttt{train\_ppo\_rssm.py}) was begun but not completed.
-    \item Hyperparameter search was largely manual; Bayesian optimisation could improve results significantly.
-    \item The three-policy architecture, inspired directly by the OBELIX paper, was surprisingly ineffective. A softer mixture-of-experts gating might be preferable to hard FSM switching.
+    \item \textbf{Hybrid residual DDQN.} In \texttt{train\_hybrid\_ddqn.py}, I tried a more structured controller. A deterministic graph proposed a small candidate set \(C_t\subseteq\mathcal{A}\) for search/align/push/unwedge, and DDQN learned only the residual choice inside that set:
+    \[
+    a_t=\arg\max_{a\in C_t}Q_\theta(f_t,a),\qquad
+    y_t=r_t+\gamma Q_{\theta^-}\!\left(f_{t+1},\arg\max_{a'\in C_{t+1}}Q_\theta(f_{t+1},a')\right).
+    \]
+    Here \(f_t\) was a compact feature vector from the hybrid controller. The motivation was pragmatic: if full RL wasted samples on obviously bad actions, restrict the action space and let RL resolve ambiguous choices. This improved further to about \(-1.8\times10^3\), but success was still occasional because a hard rule graph is brittle when walls and blinking create ambiguous sensor events.
 \end{itemize}
 
+The final working model is \texttt{ppo\_gru\_un.py}. It keeps the three-policy hierarchy, but uses raw observations and recurrent policies: GRU for find and push \citep{cho2014gru}, and LSTM for unwedge. This matched the POMDP structure better than the previous feed-forward policies while avoiding the over-engineered belief encoder.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.65cm and 0.8cm,
+    obs/.style={draw=black!70, fill=gray!12, rounded corners, align=center, minimum width=1.8cm, minimum height=0.65cm},
+    gate/.style={draw=black!70, fill=yellow!25, rounded corners, align=center, minimum width=2.1cm, minimum height=0.75cm},
+    polfind/.style={draw=black!70, fill=green!18, rounded corners, align=center, minimum width=2.2cm, minimum height=0.75cm},
+    polpush/.style={draw=black!70, fill=cyan!18, rounded corners, align=center, minimum width=2.2cm, minimum height=0.75cm},
+    polun/.style={draw=black!70, fill=red!15, rounded corners, align=center, minimum width=2.2cm, minimum height=0.75cm},
+    head/.style={draw=black!70, fill=blue!10, rounded corners, align=center, minimum width=1.8cm, minimum height=0.6cm},
+    arrow/.style={-Latex, thick, draw=black!70}
+]
+\node[obs] (o) {$o_t\in\{0,1\}^{18}$\\sonar, IR, stuck};
+\node[gate, right=of o] (m) {priority manager\\\(U\succ P\succ F\)};
+\node[polfind, above right=0.55cm and 1.0cm of m] (f) {Find policy\\Linear--Tanh\\GRU \(h^F_t\)};
+\node[polpush, right=1.0cm of m] (p) {Push policy\\Linear--Tanh\\GRU \(h^P_t\)};
+\node[polun, below right=0.55cm and 1.0cm of m] (u) {Unwedge policy\\Linear--Tanh\\LSTM \((h^U_t,c^U_t)\)};
+\node[head, right=1.0cm of p] (pi) {actor logits\\\(\ell_t^b\)};
+\node[head, above=0.35cm of pi] (v) {critic\\\(V^b_t\)};
+\node[obs, right=of pi] (a) {sample\\\(a_t\sim\pi^b_t\)};
+
+\draw[arrow] (o) -- (m);
+\draw[arrow] (m) -- node[above left, font=\scriptsize] {if no IR/stuck} (f);
+\draw[arrow] (m) -- node[above, font=\scriptsize] {IR grace} (p);
+\draw[arrow] (m) -- node[below left, font=\scriptsize] {stuck grace} (u);
+\draw[arrow] (f) -- (pi);
+\draw[arrow] (p) -- (pi);
+\draw[arrow] (u) -- (pi);
+\draw[arrow] (pi) -- (a);
+\draw[arrow] (f.east) .. controls +(1.2,0.6) and +(-0.9,0) .. (v.west);
+\draw[arrow] (p.east) .. controls +(0.8,0.3) and +(-0.9,0) .. (v.west);
+\draw[arrow] (u.east) .. controls +(1.2,-0.6) and +(-0.9,0) .. (v.west);
+
+\begin{scope}[on background layer]
+\node[draw=black!25, fill=gray!5, rounded corners, fit=(f)(p)(u), inner sep=0.25cm] {};
+\end{scope}
+\end{tikzpicture}
+\caption{Final GRU/GRU/LSTM controller. The manager selects a behaviour, the selected recurrent policy updates only its own memory, and the action is sampled from the behaviour's categorical actor.}
+\end{figure}
+
+\subsection*{Final Model in Detail}
+The final policy is a modular recurrent actor-critic. At each time step the raw observation is \(o_t\in\{0,1\}^{18}\). A deterministic priority manager selects one behaviour \(b_t\in\{F,P,U\}\), where \(F\) is find, \(P\) is push, and \(U\) is unwedge:
+\[
+b_t=
+\begin{cases}
+U, & \text{if stuck bit is active or unwedge grace is positive},\\
+P, & \text{else if IR bit is active or push grace is positive},\\
+F, & \text{otherwise}.
+\end{cases}
+\]
+The grace counters are important because the relevant physical event is not perfectly visible in a single frame. The IR bit can flicker during pushing, and the stuck bit can clear one step before the robot has safely rotated away from the wall. I used a push grace of 7 steps, an unwedge grace of 10 steps, and a post-unwedge cooldown of 10 steps to avoid immediately switching back into a wall-triggered push.
+
+Each behaviour has a separate recurrent state and a separate actor-critic network. First the raw observation is embedded:
+\[
+e_t^b=\tanh(W_e^b o_t + c_e^b).
+\]
+For find and push I used GRU cores:
+\[
+z_t^b=\sigma(W_z^b e_t^b+U_z^b h_{t-1}^b),\quad
+r_t^b=\sigma(W_r^b e_t^b+U_r^b h_{t-1}^b),
+\]
+\[
+\tilde{h}_t^b=\tanh(W_h^b e_t^b+U_h^b(r_t^b\odot h_{t-1}^b)),\quad
+h_t^b=(1-z_t^b)\odot h_{t-1}^b+z_t^b\odot \tilde{h}_t^b,
+\quad b\in\{F,P\}.
+\]
+Find benefits from GRU memory because the robot often receives long blank observations after briefly seeing the box. Push benefits because attachment is not directly observable; the policy must remember recent IR/contact evidence. I used a larger hidden size for find (\(256\)) than push (\(128\)) because find has the broader exploration problem.
+
+For unwedge I used an LSTM:
+\[
+\begin{aligned}
+i_t &= \sigma(W_i e_t^U+U_i h_{t-1}^U),\quad
+f_t = \sigma(W_f e_t^U+U_f h_{t-1}^U),\\
+g_t &= \tanh(W_g e_t^U+U_g h_{t-1}^U),\quad
+o_t^g = \sigma(W_o e_t^U+U_o h_{t-1}^U),\\
+c_t^U &= f_t\odot c_{t-1}^U+i_t\odot g_t,\quad
+h_t^U=o_t^g\odot\tanh(c_t^U).
+\end{aligned}
+\]
+I chose LSTM for unwedge because this behaviour needs a short but precise memory of the recent stuck trajectory. The cell state helps preserve whether the previous rotation was clearing or worsening the contact, which is useful near walls and corners.
+
+For the selected behaviour \(b_t\), actor and critic heads are
+\[
+\ell_t^b=W_\pi^b h_t^b+c_\pi^b,\qquad
+\pi^b(a_t|o_{\le t})=\operatorname{softmax}(\ell_t^b),\qquad
+V^b_t=W_V^b h_t^b+c_V^b.
+\]
+During training and submission, actions are sampled:
+\[
+a_t\sim \pi^{b_t}(\cdot|o_{\le t}),
+\]
+instead of using \(\arg\max_a \pi(a|o_{\le t})\). This kept evaluation consistent with the stochastic PPO policy and avoided prematurely collapsing into repeated turn actions.
+
+The recurrent PPO update stores the recurrent state at the start of each step. For a chunk starting at time \(k\), the update replays \(o_k,\ldots,o_{k+T-1}\) from the stored \(h_k\) or \((h_k,c_k)\), with \(T=16\). Advantages use GAE:
+\[
+\delta_t=r_t+\gamma V_{t+1}(1-d_t)-V_t,\qquad
+A_t=\sum_{l\ge 0}(\gamma\lambda)^l\delta_{t+l}.
+\]
+The optimized loss for each behaviour is
+\[
+\mathcal{L}_b
+=-\mathbb{E}\left[\min(\rho_t A_t,\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)A_t)\right]
++c_v\mathbb{E}(V_t-R_t)^2-c_e\mathbb{E}\mathcal{H}(\pi_t),
+\]
+where \(\rho_t=\pi_\theta(a_t|o_{\le t})/\pi_{\theta_{\mathrm{old}}}(a_t|o_{\le t})\). This preserves PPO's trust-region-like update while allowing gradients to flow through short recurrent sequences.
+
+Reward shaping in the final model was deliberately local and small. For push, forward motion with recent IR evidence and no stuck bit received a bonus; other push actions received a penalty. For unwedge, continued stuck frames received a capped increasing penalty, while clearing both stuck and IR received an escape bonus. The find policy was mostly left on raw rewards, because earlier experiments showed that dense find bonuses produced sensor-chasing and spin loops.
+
+\section{Experiments and Implementation Details}
+All main training scripts use the same environment wrapper idea: seeded OBELIX instances, vectorized rollout collection, and periodic checkpointing. The important variants were as follows.
+
+\begin{table}[H]
+\centering
+\caption{Main implementation variants.}
+\begin{tabular}{p{0.20\linewidth}p{0.29\linewidth}p{0.41\linewidth}}
+\toprule
+Script & Model & Key details \\
+\midrule
+\texttt{train\_ddqn.py} & Double DQN MLP & \(18\)-bit input, replay \(5\cdot10^5\), target sync, \(\epsilon\)-greedy, 8 parallel envs. \\
+\texttt{train\_ppo\_frame\_stacking.py} & PPO MLP & BeliefStateEncoder, frame stacking, GAE, entropy bonus, RewardShaper. \\
+\texttt{train\_ppo\_lstm.py} & PPO LSTM & Recurrent latent belief with previous action, reward, and done inputs; curriculum over difficulties. \\
+\texttt{train\_ppo\_three\_policy.py} & Three PPO MLPs & Find/push/unwedge policies, behaviour manager, optional raw observation, anti-spin penalty. \\
+\texttt{train\_ppo\_three\_policy\_latent.py} & Three latent recurrent PPOs & Learned latent belief, optional curiosity, curriculum; performed poorly on Codabench. \\
+\texttt{train\_ppo\_epb.py} & PPO EPB & CompactBeliefState, dual find/push heads, learned gate, curriculum; better but still unstable. \\
+\texttt{train\_hybrid\_ddqn.py} & Hybrid DDQN & Rule graph proposes valid actions; DDQN learns residual selection over candidates. \\
+\texttt{ppo\_gru\_un.py} & Three recurrent PPOs & GRU find, GRU push, LSTM unwedge, raw observations, truncated BPTT. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The final recurrent PPO used Adam, \(\gamma=0.99\), \(\lambda=0.95\), learning rate \(3\cdot10^{-4}\), horizon \(2048\), mini-batch size \(64\) for non-recurrent code paths, PPO clip \(0.2\), value coefficient \(0.5\), entropy coefficient \(0.01\), gradient clipping at \(0.5\), and recurrent chunks of length \(16\). The final architecture is
+\[
+o_t \in \{0,1\}^{18}
+\xrightarrow{\text{Linear+Tanh}}
+e_t
+\xrightarrow{\mathrm{GRU/LSTM}}
+h_t
+\xrightarrow{\text{actor, critic}}
+\pi(a_t|h_t), V(h_t).
+\]
+For the final version, the hidden sizes were \(256\) for find-GRU, \(128\) for push-GRU, and \(64\) for unwedge-LSTM. Training used stochastic sampling from the policy; the matching submission agent also samples from the learned categorical distribution instead of taking an argmax.
+
+\begin{table}[H]
+\centering
+\caption{Final \texttt{ppo\_gru\_un.py} hyperparameters.}
+\begin{tabular}{p{0.20\linewidth}p{0.25\linewidth}p{0.20\linewidth}p{0.25\linewidth}}
+\toprule
+Component & Value & Component & Value \\
+\midrule
+Observation & raw 18-bit vector & Actions, find/push & \(\{\text{L22},\text{FW},\text{R22}\}\) \\
+Actions, unwedge & \(\{\text{L45},\text{FW},\text{R45}\}\) & Optimizer & Adam \\
+Learning rate & \(3\cdot10^{-4}\) & Horizon & \(2048\) \\
+PPO epochs & \(10\) & Clip \(\epsilon\) & \(0.2\) \\
+\(\gamma\) & \(0.99\) & GAE \(\lambda\) & \(0.95\) \\
+Value coefficient & \(0.5\) & Entropy coefficient & \(0.01\) \\
+Find memory & GRU, 256 & Push memory & GRU, 128 \\
+Unwedge memory & LSTM, 64 & BPTT chunk & 16 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm and 0.7cm,
+    block/.style={draw, rounded corners, align=center, minimum width=1.7cm, minimum height=0.55cm},
+    arrow/.style={-Latex, thick}
+]
+\node[block] (raw) {18-bit\\obs};
+\node[block, right=of raw] (enc) {linear\\tanh};
+\node[block, right=of enc] (rnn) {GRU/LSTM\\state};
+\node[block, above right=0.15cm and 0.8cm of rnn] (actor) {actor\\logits};
+\node[block, below right=0.15cm and 0.8cm of rnn] (critic) {critic\\value};
+\draw[arrow] (raw) -- (enc);
+\draw[arrow] (enc) -- (rnn);
+\draw[arrow] (rnn) -- (actor);
+\draw[arrow] (rnn) -- (critic);
+\end{tikzpicture}
+\caption{Shared policy template for the final recurrent policies. Only the recurrent core type and hidden size differ across behaviours.}
+\end{figure}
+
+\section{Results}
+\begin{table}[H]
+\centering
+\caption{Qualitative and Codabench result log.}
+\begin{tabular}{p{0.24\linewidth}p{0.18\linewidth}p{0.20\linewidth}p{0.28\linewidth}}
+\toprule
+Variant & Phase & Codabench mean & Observation \\
+\midrule
+Double DQN & Phase 1 & \_\_\_\_ & Useful baseline; solved easy static cases sometimes. \\
+PPO frame stacking & Phase 2 & $\mathcal{O}(-10^5)$ & Local completion did not transfer to Codabench. \\
+PPO LSTM & Phase 2 & $\mathcal{O}(-10^5)$ & Memory helped locally but not enough for walls. \\
+Three-policy PPO & Phase 3 & \_\_\_\_ & Behaviour split was correct, but spinning remained. \\
+Three-policy latent PPO & Final & $\approx -2\cdot 10^5$ & Learned latent/curiosity was too unstable. \\
+PPO-EPB & Final & $\approx -1.5\cdot 10^4$ & Explicit memory improved recovery and phase tracking. \\
+Hybrid DDQN & Final & $\approx -1.8\cdot 10^3$ & Rule graph reduced action search; still occasional spinning. \\
+GRU/GRU/LSTM PPO & Final & \_\_\_\_ & Best working model; recurrent memory with raw observations generalized best. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The main empirical pattern was that extra engineered features did not consistently improve leaderboard performance. Locally they often made the policy look better, but Codabench exposed overfitting to sensor summaries and shaped rewards. Raw observations plus recurrent memory was more robust because it let the policy learn its own belief state while preserving the true simulator signal.
+
+Two comparisons were especially informative. First, frame stacking and LSTM both tried to address partial observability, but frame stacking has a fixed memory horizon while the LSTM was trained as one monolithic controller. In contrast, the final model separates the memories by behaviour; the push memory is not overwritten during long find periods, and the unwedge memory is only updated when the stuck-recovery subproblem is active. Second, the hybrid DDQN showed that hand-coded structure can reduce the action search space, but it remained brittle because its graph still had hard cases around wall contacts. The final PPO model kept the useful structure--find, push, unwedge--but learned the action distributions inside each behaviour.
+
+The final result should therefore be interpreted as a design result as much as a score result. The best architecture was not the largest or most feature-rich one. It was the one whose inductive bias matched the simulator: raw local sensors, a small priority hierarchy, and recurrent state where the environment hides information.
+
+\section{Error Analysis and Discussion}
+The dominant failure mode in Level 1 was blind spinning: once all sonar bits were zero, a feed-forward policy could converge to repeated turns because each blank observation looked identical. Level 2 added false negatives from blinking. The agent could lose contact with a previously visible box and treat the blank frame as a new search problem. Level 3 added motion, so stale direction estimates became actively misleading. Walls were the hardest case because the wall can trigger sonar, IR, and stuck bits similar to the box; pushing into the wall also creates large negative rewards.
+
+The most surprising result was that the larger handcrafted belief representation was not the best solution. It encoded useful quantities, but it also exposed the policy to shaped statistics that did not always match the hidden evaluation seeds. The modular hierarchy was still useful, but only after adding recurrent state to the active behaviours. The final limitation is that the behaviour manager is still hand-coded. With more time, I would learn the gating policy jointly, add a wall-aware auxiliary prediction task, and run systematic ablations on recurrent hidden size and entropy schedules.
+
+A second limitation is that the final pusher uses an inferred attachment state. The simulator has an internal \texttt{enable\_push} flag, but the submitted policy only sees \(o_t\). My training code uses an IR probe to reduce false pushes, but this is still a heuristic. A cleaner version would learn a latent Bernoulli variable \(z_t^{\mathrm{attach}}\) with an auxiliary loss from simulator labels during training, and then use \(p(z_t^{\mathrm{attach}}|o_{\le t})\) at test time. Similarly, wall discrimination could be framed as an auxiliary prediction problem:
+\[
+\hat{w}_t = f_\psi(h_t),\qquad
+\mathcal{L}_{\mathrm{wall}}=\operatorname{BCE}(\hat{w}_t,w_t),
+\]
+where \(w_t\) is available during training from simulator geometry but not used by the final policy input.
 
 \section{Conclusion}
-
-The main takeaway of this project is counter-intuitive: in a sparse-reward POMDP, \emph{less engineering is more}.
-Hand-crafted reward shaping and feature encoding consistently hurt performance, while raw PPO trained directly on the environment reward achieved scores three orders of magnitude better.
-This likely reflects reward hacking: the agent optimises the artificial shaped signal at the expense of the true objective.
-
-The best agent (GRU multi-head PPO, $+157.4$) demonstrates that memory is beneficial for this POMDP -- but the type of memory matters.
-Explicit, non-decaying belief states (EPB) are a principled alternative to GRU washout, and the architecture design appears sound; completing the training run is the primary remaining step.
-
-Future directions include: training with model-based RL (RSSM / Dreamer) to learn a latent world model from binary observations, applying curriculum learning more aggressively, and exploring soft gating (mixture of experts) rather than hard FSM phase detection.
-
+The project progressed from a simple Double-DQN baseline to a recurrent modular PPO controller. The strongest lesson was that OBELIX is not just a small discrete-action task; the hidden phase and intermittent sensors make memory essential. The final GRU/GRU/LSTM three-policy PPO retained the behaviour-based insight from the original OBELIX paper while using modern actor-critic training. Future work should focus on learned phase gating, better wall discrimination, and curriculum/evaluation protocols that reduce the gap between local rollouts and Codabench.
 
 \section*{LLM Usage Declaration}
-\begin{itemize}
-\item \textbf{Which Large Language Model (LLM) did you use?} \\
-Claude (Anthropic) via Claude Code CLI.
-
-\item \textbf{In which part did you use the LLM, and how?}
-
-\begin{tabular}{l|l|p{6cm}}
+\begin{table}[H]
+\centering
+\begin{tabular}{p{0.30\linewidth}p{0.18\linewidth}p{0.42\linewidth}}
 \toprule
 Part & Used LLM? & Purpose of Using LLM \\
 \midrule
-Understanding concepts & Yes & Clarifying PPO/POMDP concepts and GRU memory dynamics \\
-Ideation / brainstorming & Yes & Discussing EPB belief state design and curriculum structure \\
-Debugging small code snippets & Yes & Fixing shape mismatches and vectorised-env bugs \\
-Plotting / visualization code & No &   \\
-Grammar / writing style & Yes & Improving report prose and structure \\
-Report structure / section ideas & Yes & Drafting section outlines \\
-Other & Yes & Generating training scripts (\texttt{train\_ppo\_epb.py}, \texttt{compact\_belief.py}) \\
+Understanding concepts & No & Used course material, code, and the OBELIX paper. \\
+Ideation / brainstorming & Yes & Discussed how to summarize the experiment sequence. \\
+Debugging small code snippets & Yes & Used for localized checks and report-related code edits. \\
+Plotting / visualization code & Yes & Used to draft compact TikZ architecture diagrams. \\
+Grammar / writing style & Yes & Used to make the report concise. \\
+Report structure / section ideas & Yes & Used the provided report template and LLM assistance to organize content. \\
+Other & No & -- \\
 \bottomrule
 \end{tabular}
+\end{table}
 
-\item \textbf{Other sources consulted:} \\
-OBELIX competition paper~\cite{obelix}; Schulman et al.\ PPO paper~\cite{ppo}; Stable-Baselines3 documentation for PPO implementation reference.
-
-\item \textbf{Personal contribution:} \\
-The core experimental journey -- selecting which algorithms to try, recognising that shaped rewards hurt performance, designing the three-policy vs.\ single-agent ablation, devising the non-decaying EPB belief state, and running all training and evaluation -- was driven by the student.
-The LLM assisted with implementation and writing; all architectural decisions, observations, and conclusions are the student's own.
-\end{itemize}
-
-\vspace{2cm}
+Apart from LLM usage, the implementation, experiment design, Codabench submissions, local evaluation, and interpretation of failures were my own work. I referred to the original OBELIX paper, standard DQN/DDQN and PPO papers, the course materials, and the provided simulator/codebase.
 
 \bibliographystyle{ieeetr}
 \bibliography{references}
