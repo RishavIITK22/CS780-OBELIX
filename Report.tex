@@ -8,6 +8,7 @@
 \usepackage{subcaption}
 \usepackage[numbers]{natbib}
 \usepackage{graphicx}
+\usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{array}
 \usepackage{multirow}
@@ -94,79 +95,163 @@ The objective is to maximise mean cumulative reward (per episode, scaled by 5) a
 
 \subsection{Phase 1: Double DQN Baseline}
 
-The starting point was a Double DQN (DDQN) agent trained on the raw 18-dimensional binary observation.
-The network was a three-layer MLP (18~$\to$~64~$\to$~64~$\to$~5) with $\epsilon$-greedy exploration.
-A vectorised environment (\texttt{vec\_env.py}) was written to run $N$ OBELIX instances in parallel subprocesses for faster data collection.
-A \texttt{RewardShaper} (\texttt{reward\_shaper.py}) was also implemented, adding sensor-evidence bonuses during the find phase, a forward-progress bonus during push, an escalating stuck penalty, and a recovery bonus.
-A \texttt{BeliefStateEncoder} (\texttt{state\_encoder.py}) was implemented to enrich the 18-bit observation with sector strengths, direction summaries, temporal memory flags, and transition cues, producing a 49-dimensional per-frame core which could be further stacked across $k$ timesteps.
+\paragraph{POMDP formulation.}
+OBELIX is formally a POMDP $\langle \mathcal{S}, \mathcal{A}, \mathcal{O}, T, \Omega, R, \gamma \rangle$.
+The true state $s_t \in \mathcal{S}$ includes robot pose, box position, and phase; only observation $o_t \in \{0,1\}^{18}$ is accessible.
+The agent must maximise $\mathbb{E}\bigl[\sum_{t=0}^{T} \gamma^t r_t\bigr]$ with $\gamma = 0.99$.
 
-DDQN with shaped rewards and encoded observations produced poor results on local evaluation; the results from the early template agent on codabench confirmed this ($-13931$, $-16100$, Table~\ref{tab:submissions}).
+\paragraph{Algorithm.}
+The starting point was a Double DQN (DDQN) agent.
+DQN approximates the action-value function $Q^*(s,a) = \max_\pi \mathbb{E}\bigl[\sum_{t} \gamma^t r_t \mid s_0{=}s, a_0{=}a\bigr]$ with a neural network $Q(o;\theta)$.
+DDQN decouples action \emph{selection} from action \emph{evaluation} to reduce maximisation bias:
+\begin{equation}
+  y_t = r_t + \gamma\, Q\!\bigl(o_{t+1},\,\arg\max_{a'} Q(o_{t+1},a';\theta);\,\theta^{-}\bigr),
+  \label{eq:ddqn}
+\end{equation}
+where $\theta^{-}$ is a periodically-copied target network.
+The network was a three-layer MLP ($18 \to 64 \to 64 \to 5$) with $\epsilon$-greedy exploration; the loss was
+$\mathcal{L}(\theta) = \mathbb{E}\bigl[(y_t - Q(o_t, a_t; \theta))^2\bigr]$.
+
+\paragraph{Infrastructure built.}
+A vectorised environment (\texttt{vec\_env.py}) ran $N$ OBELIX instances in parallel subprocesses.
+A \texttt{RewardShaper} (\texttt{reward\_shaper.py}) defined a shaped reward
+\begin{equation}
+  \tilde{r}_t = r_t + F(o_t, a_t),
+  \label{eq:shaping}
+\end{equation}
+with sensor-evidence bonuses (find phase), a forward-progress bonus (push), and an escalating stuck penalty.
+A \texttt{BeliefStateEncoder} (\texttt{state\_encoder.py}) expanded $o_t \in \{0,1\}^{18}$ into a 49-dimensional frame with sector strengths, direction summaries, and temporal-memory flags.
+
+\paragraph{Failure.}
+DDQN with $\tilde{r}_t$ and encoded observations scored $-13{,}931$ on codabench.
+Two factors contributed.
+First, DDQN's off-policy replay is well-suited to dense-reward tasks; the OBELIX reward is sparse and highly delayed (success bonus only at episode end), making the bootstrapped TD target $y_t$ (Eq.~\ref{eq:ddqn}) extremely noisy early in training.
+Second, the shaping term $F$ was not potential-based ($F \neq \gamma\Phi(o') - \Phi(o)$), so it changed the optimal policy~\cite{ng1999policy}: the agent learned to exploit sensor bonuses without completing the task.
 
 \subsection{Phase 2: PPO and the Surprising Benefit of Simplicity}
 
-Switching to Proximal Policy Optimisation (PPO) with a shared-trunk MLP actor-critic (two Tanh hidden layers, 128 units each) and raw 18-dimensional observations showed a dramatic improvement.
-When trained \emph{without} reward shaping and \emph{without} encoded observations, codabench mean scores reached $+229.9$ and then $+539.9$.
-By contrast, enabling the \texttt{RewardShaper} and \texttt{BeliefStateEncoder} on the same PPO architecture led to scores of $-111{,}868$ and $-136{,}027$ -- roughly three orders of magnitude worse.
+\paragraph{Algorithm.}
+Proximal Policy Optimisation (PPO)~\cite{ppo} directly optimises the policy $\pi_\theta(a \mid o)$ using the clipped surrogate objective:
+\begin{equation}
+  \mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[\min\!\left(\rho_t(\theta)\,\hat{A}_t,\;\operatorname{clip}\!\left(\rho_t(\theta), 1{-}\varepsilon, 1{+}\varepsilon\right)\hat{A}_t\right)\right],
+  \label{eq:ppo}
+\end{equation}
+where $\rho_t(\theta) = \pi_\theta(a_t \mid o_t)/\pi_{\theta_{\text{old}}}(a_t \mid o_t)$ is the importance ratio and $\hat{A}_t$ is the Generalised Advantage Estimate (GAE):
+\begin{equation}
+  \hat{A}_t = \sum_{\ell=0}^{T-t-1}(\gamma\lambda)^\ell \delta_{t+\ell}, \qquad \delta_t = r_t + \gamma V_\theta(o_{t+1}) - V_\theta(o_t).
+  \label{eq:gae}
+\end{equation}
+The full PPO loss is
+$\mathcal{L} = -\mathcal{L}^{\text{CLIP}} + c_v \mathcal{L}^{\text{VF}} - c_e \mathcal{H}[\pi_\theta]$,
+where $\mathcal{L}^{\text{VF}} = \mathbb{E}_t[(V_\theta(o_t)-V^{\text{target}}_t)^2]$ and $\mathcal{H}$ is the policy entropy (exploration regulariser).
+A shared-trunk MLP actor-critic was used: $f_\theta: \mathbb{R}^{18} \to \mathbb{R}^{128}$ (two Tanh layers), $\pi_\theta(\cdot \mid o) = \operatorname{softmax}(W_a f_\theta(o))$, $V_\theta(o) = w_v^\top f_\theta(o)$.
 
-This result was unexpected and informative: the hand-crafted shaping terms and engineered features were actively misleading the agent, either introducing conflicting gradients or preventing the policy from learning the actual task reward signal.
-The conclusion drawn was that for a sparse-reward POMDP of this type, \emph{clean raw observations and unmodified environment rewards are preferable} to dense shaping.
+\paragraph{Key finding: shaping is harmful.}
+Raw PPO (no shaping, raw 18-bit obs) scored $+539.9$; the identical architecture with $\tilde{r}_t$ and encoded observations scored $-111{,}868$.
+The mechanism: $F$ in Eq.~\ref{eq:shaping} provides dense per-step signal, so the PPO advantage estimate (Eq.~\ref{eq:gae}) is dominated by $F$-shaped values.
+The policy gradient points toward maximising $\sum F$ rather than $\sum r$, pushing the agent into a local optimum of circling near sensor fields without completing the task.
 
-PPO with frame stacking (stacking $k$ raw observations) was also evaluated.
-It gave modest improvements on local evaluation but did not clearly outperform the single-frame baseline on codabench.
+\paragraph{Frame stacking.}
+To partially address partial observability, $k$ consecutive frames were concatenated:
+$\bar{o}_t = [o_{t-k+1}, \ldots, o_t] \in \{0,1\}^{18k}$,
+approximating the history-conditioned policy $\pi(a_t \mid h_t) \approx \pi(a_t \mid \bar{o}_t)$.
+This is a $k$-Markov approximation and fails when the box is invisible for $> k$ steps -- common in Levels~2 and~3.
+Results on codabench did not clearly improve over the single-frame baseline.
 
-An LSTM-augmented policy (\texttt{train\_ppo\_lstm.py}) was tried next as a natural extension for handling partial observability.
-The LSTM maintained a hidden state across timesteps and could, in principle, remember the last box direction across blank sensor steps.
-However, in practice the LSTM agent also failed to match the raw-PPO baseline, particularly when combined with shaped rewards.
-By the end of Phase 2, the best performing checkpoint remained the plain PPO agent with raw observations and unshaped rewards, scoring $-238.6$ in the final Phase~2 submission.
+\paragraph{LSTM.}
+An LSTM-augmented policy addressed the $k$-Markov limitation by maintaining a hidden state $h_t$ across the full episode:
+\begin{equation}
+  (h_t, c_t) = \operatorname{LSTM}(o_t,\, h_{t-1},\, c_{t-1}), \qquad \pi_\theta(a_t \mid h_t).
+\end{equation}
+Training used truncated BPTT over windows of length $T_{\text{bptt}}=512$.
+In practice, LSTM gradients decay as $\prod_{\tau} \partial h_{\tau+1}/\partial h_\tau$; older time steps ($>$50--100 steps back) contributed negligible gradient, so the agent still could not reliably retain box direction across blank periods of $200{+}$ steps.
+Combined with the shaped reward it produced even worse results, ending Phase~2 with a final submission of $-238.6$.
 
 \subsection{Phase 3: Three-Policy Architecture and GRU Recovery}
 
-Motivated by reading the OBELIX paper~\cite{obelix}, Phase 3 explored a behaviour-decomposed architecture matching the paper's three-behaviour hierarchy:
-\[
-\text{unwedge} \succ \text{push} \succ \text{find}
-\]
-A \texttt{BehaviorManager} (\texttt{behavior\_manager.py}) selected the active sub-policy at each step based on sensor evidence.
-Three independent PPO actor-critic heads were trained, each receiving the same 18-bit (or encoded) observation.
-An \texttt{AntiSpinPenaltyTracker} (\texttt{anti\_spin\_penalty.py}) was added to penalise repetitive rotation during the find phase.
+\paragraph{Three-policy hierarchy.}
+Motivated by the OBELIX paper~\cite{obelix}, Phase~3 implemented a behaviour-decomposed architecture with priority ordering:
+\begin{equation}
+  b_t = \begin{cases} \texttt{unwedge} & \text{if } \texttt{STUCK} \wedge \texttt{IR} \\ \texttt{push} & \text{if } \texttt{IR} \\ \texttt{find} & \text{otherwise} \end{cases}
+  \label{eq:fsm}
+\end{equation}
+Three independent PPO actor-critic networks $\{\pi^b_\theta\}_{b \in \{\texttt{find},\texttt{push},\texttt{unwedge}\}}$ were trained.
+The gradient update for policy $b$ only uses timesteps where $b_t = b$:
+\begin{equation}
+  \nabla_\theta \mathcal{L}^b = \mathbb{E}_t\!\left[\mathbf{1}[b_t = b]\cdot \nabla_\theta \log \pi^b_\theta(a_t \mid o_t)\cdot \hat{A}_t\right].
+\end{equation}
 
-Despite alignment with the paper's intuition, the three-policy agent performed poorly in practice.
-Codabench scores ranged from $-31{,}641$ to $-158{,}772$ across variants.
-Switching to a latent-space version (\texttt{agent\_three\_policy\_latent}) did not help, yielding $-114{,}049$.
-The likely cause was policy interference: the sharp handoffs between sub-policies produced inconsistent reward signals, and the naive FSM phase detector frequently mis-classified the current phase.
+\paragraph{Failure analysis.}
+The FSM selector (Eq.~\ref{eq:fsm}) relies on clean sensor readings.
+During blinking (Level~2) and while pushing (where \texttt{IR} can flicker), $b_t$ mis-classified frequently, so the push policy received gradients from find-phase timesteps and vice versa -- a form of \emph{policy interference}.
+Additionally, $\mathbf{1}[b_t = b]$ masks out the majority of timesteps for each head, starving the gradient signal.
+Scores ranged from $-31{,}641$ to $-158{,}772$.
 
-Recognising the failure of hard phase-switching, the next attempt (\texttt{ppo\_gru.py}, \texttt{agent\_ppo\_gru\_un.py}) replaced the three separate heads with a unified agent containing:
-\begin{itemize}[noitemsep]
-    \item An MLP actor-critic for the find and push phases (shared backbone, 18 $\to$ 128 $\to$ 128, Tanh).
-    \item A separate GRU-based actor-critic for the unwedge phase, where temporal context matters most for detecting that the box is wedged.
-    \item A rule-based phase selector that latches on IR attachment.
-\end{itemize}
-This agent was trained without any reward shaping, directly on the raw environment reward.
-It achieved codabench scores of $-394.2$ and $+157.4$, the best result of the project.
+\paragraph{GRU multi-head PPO.}
+Replacing hard phase-switching with a unified recurrent agent (\texttt{ppo\_gru.py}):
+\begin{align}
+  h_t &= \underbrace{(1 - z_t) \odot h_{t-1}}_{\text{retain}} + \underbrace{z_t \odot \tilde{n}_t}_{\text{update}}, \label{eq:gru} \\
+  z_t &= \sigma\!\left(W_z [h_{t-1};\, o_t] + b_z\right), \quad
+  r_t = \sigma\!\left(W_r [h_{t-1};\, o_t] + b_r\right), \quad
+  \tilde{n}_t = \tanh\!\left(W_n [r_t \odot h_{t-1};\, o_t] + b_n\right). \notag
+\end{align}
+The find/push MLP and GRU-based unwedge head shared training data without any masking.
+All reward shaping was removed.
+This yielded scores of $-394.2$ (no walls) and $+157.4$ (with walls) -- the best results of the project.
+
+\paragraph{GRU washout (identified failure mode).}
+During blank sensor steps, the update gate $z_t \approx \sigma(b_z)$ is small (no informative input), so from Eq.~\ref{eq:gru}:
+\begin{equation}
+  \|h_{t+T}\| \approx (1 - \bar{z})^T \|h_t\| \xrightarrow{T \to \infty} 0,
+  \label{eq:washout}
+\end{equation}
+where $\bar{z}$ is the mean update-gate activation.
+After $T \sim 200$ blank steps the hidden state approaches zero, erasing the last-known box direction.
+This is the primary failure mode on Level~2 and Level~3.
 
 \subsection{EPB: Explicit Phase Belief Agent (Final Approach)}
 
-The GRU agent suffered from a known failure mode: after many consecutive blank sensor steps (common in Level~2 and Level~3), the GRU hidden state is washed toward zero by the recurrent dynamics, erasing the last-known box direction.
-Phase mis-detection by the FSM also caused spurious transitions.
+\paragraph{Motivation.}
+The GRU washout (Eq.~\ref{eq:washout}) is intrinsic to any recurrent unit with bounded activations.
+The EPB agent replaces learned recurrence with an \emph{explicit, non-decaying belief state} $b_t \in \mathbb{R}^{16}$ (\texttt{compact\_belief.py}).
 
-To address both issues, the \textbf{Explicit Phase Belief (EPB)} agent (\texttt{train\_ppo\_epb.py}, \texttt{agent\_epb.py}) was designed around a hand-crafted 16-dimensional belief state (\texttt{compact\_belief.py}):
+\paragraph{Belief update rule.}
+Unlike a GRU, the last-visible direction fields update only when a sensor fires and never decay:
+\begin{equation}
+  d_t^{\text{dir}} =
+  \begin{cases}
+    \phi^{\text{dir}}(o_t) & \text{if } \textstyle\sum_i o_t^{(i)} > 0 \quad \text{(sensor active)} \\
+    d_{t-1}^{\text{dir}} & \text{otherwise}
+  \end{cases}
+  \label{eq:belief_update}
+\end{equation}
+for direction $\text{dir} \in \{\text{left}, \text{front}, \text{right}, \text{IR}\}$, where $\phi^{\text{dir}}$ aggregates the relevant sonar bits.
+A staleness counter $\tau_t = \min(\tau_{t-1} + \mathbf{1}[\text{blank}],\, 500)$ and phase latch $\texttt{attached}_t = \texttt{attached}_{t-1} \vee \mathbf{1}[\text{IR active for} \ge 2\text{ steps}]$ complete the 16-dim state.
 
-\begin{itemize}[noitemsep]
-    \item \textbf{Non-decaying last-visible direction:} Fields \texttt{last\_visible\_left/front/right/ir} update \emph{only when a sensor fires} and never decay on blank steps.
-    \item \textbf{Staleness counter:} \texttt{steps\_since\_visible} counts up (capped at 500); the agent knows how stale its last sighting is.
-    \item \textbf{Attachment latch:} \texttt{attached} latches True on two consecutive IR activations and is never reset within an episode.
-    \item \textbf{Stuck severity, recovery edge, exploration direction:} additional scalars for nuanced behaviour.
-\end{itemize}
+\paragraph{Network.}
+The 39-dimensional policy input is:
+\begin{equation}
+  x_t = [\,\underbrace{o_t}_{18}\;\|\;\underbrace{b_t}_{16}\;\|\;\underbrace{\phi^{\text{FSM}}(o_t, b_t)}_{5}\,],
+  \label{eq:epb_input}
+\end{equation}
+where $\phi^{\text{FSM}}$ is a one-hot encoding of the reactive FSM action suggestion (orient toward last-seen direction, spin if blind, push if attached) used as a soft prior.
 
-The 39-dimensional input to the policy is:
-\[
-[\underbrace{\text{raw obs}}_{18} \;\|\; \underbrace{\text{belief vector}}_{16} \;\|\; \underbrace{\text{FSM one-hot}}_{5}]
-\]
-The FSM one-hot encodes a reactive hand-coded action suggestion (orient toward nearest sensor, spin if blind, push forward if attached) as a soft prior.
+A \textbf{dual-head actor-critic} with a learned soft gate replaces the hard FSM selector:
+\begin{equation}
+  \mathbf{l}_t = (1 - g_t)\,\mathbf{l}^{\text{find}}_t + g_t\,\mathbf{l}^{\text{push}}_t, \qquad
+  g_t = \sigma\!\left(w_g^\top f_\theta(x_t)\right),
+  \label{eq:gate}
+\end{equation}
+with $f_\theta: \mathbb{R}^{39} \to \mathbb{R}^{128}$ (two Tanh layers).
+The gate is supervised by a binary cross-entropy auxiliary loss:
+\begin{equation}
+  \mathcal{L}^{\text{gate}} = -\bigl[\hat{g}_t \log g_t + (1-\hat{g}_t)\log(1-g_t)\bigr], \quad \hat{g}_t = \texttt{env.enable\_push},
+\end{equation}
+added to the PPO objective with weight $c_g = 0.5$.
+This soft gating is continuous and differentiable, resolving the policy-interference problem of the hard FSM.
 
-The network is a \textbf{dual-head actor-critic}: a shared MLP trunk (39~$\to$~128~$\to$~128, Tanh) feeds both a \emph{find} actor head and a \emph{push} actor head, plus a learned sigmoid gate supervised by \texttt{env.enable\_push} and a shared critic head.
-The combined logits are $\mathbf{l} = (1 - g)\,\mathbf{l}_\text{find} + g\,\mathbf{l}_\text{push}$ where $g$ is the gate output.
-
-Training used a 5-stage arena curriculum to ensure dense push-head gradients early:
+\paragraph{Curriculum.}
+Training used a 6-stage arena curriculum to ensure dense push-head gradients from the start (small arena $\Rightarrow$ box found quickly $\Rightarrow$ gate and push head receive signal early):
 \begin{enumerate}[noitemsep]
     \item 300~px arena, static box, 800 episodes
     \item 400~px arena, static box, 1000 episodes

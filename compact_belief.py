@@ -176,42 +176,113 @@ class CompactBeliefState:
 
     # ------------------------------------------------------------------
     def fsm_suggest(self, obs) -> str:
-        """Reactive FSM suggestion used as a soft training-time prior.
+        """Deterministic FSM action suggestion used as a soft training-time prior.
 
-        In find phase: orient toward nearest sensor reading; spin if blind.
-        In push phase: always FW; alternate turns if stuck.
+        Priority order (highest → lowest):
+          1. Attached → push forward; escape if stuck
+          2. Wall collision (STUCK) → alternate-direction escape rotation
+          3. IR or near-front active → FW (direct approach / attach)
+          4. Moderate front signal → fine-tune alignment, then FW
+          5. Asymmetric near-side → turn toward it
+          6. Symmetric near-side (box broadly ahead) → FW
+          7. Asymmetric far-side → gentle turn toward it
+          8. Symmetric far-side → FW (box straight ahead or behind)
+          9. Recent memory (steps_since_visible < 25) → navigate to last-seen dir
+         10. Fully blind → boustrophedon (lawnmower): FW×40 → L22×4 → FW×6 → L22×4
+             Two L22×4 bursts = 176° total ≈ 180° → sweeps back in adjacent lane.
+             Half-cycle = 54 steps; ~80% forward, covers a fresh strip each pass.
         """
         lf, ln, ff, fn, rf, rn, ir, stk, _ = parse_obs(obs)
 
+        # 1. Attached → push / unwedge
         if self.attached:
-            # Push / unwedge
             if stk:
                 return "L45" if (self.push_stuck_count % 4) < 2 else "R45"
             return "FW"
 
-        # Find phase
+        # 2. Wall-stuck escape
         if stk:
             return "L45" if (self.consecutive_stuck % 4) < 2 else "R45"
-        if ir:
+
+        # 3. Strong direct signal → approach immediately
+        if ir or fn:
             return "FW"
-        if fn:
-            return "FW"
+
+        # 4. Moderate front signal → align then drive in
         if ff:
             if rn and not ln:
                 return "L22"
             if ln and not rn:
                 return "R22"
             return "FW"
+
+        # 5. Asymmetric near-side → turn toward closer side
         if ln and not rn:
             return "L22"
         if rn and not ln:
             return "R22"
+
+        # 6. Symmetric near-side → box is broadly ahead, drive forward
+        if ln and rn:
+            return "FW"
+
+        # 7. Asymmetric far-side → gentle turn
         if lf and not rf:
             return "L22"
         if rf and not lf:
             return "R22"
-        # Blind exploration: spin in current direction
-        return "L22" if self.spin_dir else "R22"
+
+        # 8. Symmetric far-side → box ahead or directly behind, drive forward
+        if lf and rf:
+            return "FW"
+
+        # 9. Recent memory: box was visible < 25 steps ago — navigate toward it
+        #    Uses the non-decaying last_visible_* fields from CompactBeliefState.
+        if self.steps_since_visible < 25:
+            if self.last_visible_ir or self.last_visible_front:
+                return "FW"
+            if self.last_visible_left and not self.last_visible_right:
+                return "L22"
+            if self.last_visible_right and not self.last_visible_left:
+                return "R22"
+            return "FW"   # symmetric last sighting → drive forward
+
+        # 10. Fully blind: boustrophedon (lawnmower) sweep
+        #
+        #  Half-cycle structure (54 steps):
+        #    FW × 40  — sweep one lane
+        #    ?? × 4   — first 88° turn (face perpendicular toward next lane)
+        #    FW × 6   — step into the next lane
+        #    ?? × 4   — second 88° turn (face back: 176° total from start)
+        #
+        #  The turn direction ALTERNATES each half-cycle:
+        #    even halves → L22  (going, say, East → turns toward North)
+        #    odd  halves → R22  (going West  → turns toward North again)
+        #
+        #  This ensures the lane-shift FW always advances in the SAME
+        #  perpendicular direction regardless of sweep heading.
+        #  If both turns were always L22, the odd-half shift would go South,
+        #  partially cancelling the even-half North shift → near-zero net advance.
+        #
+        #  Net perpendicular advance per full cycle (108 steps): ~15 px.
+        #  With sonar range ~50 px each side, strips overlap slightly → no gaps.
+        #  85 % of blind steps are FW, giving ~15× more arena coverage vs spinning.
+        _SWEEP = 40   # forward leg (~120 px at 3 px/step in a 500 px arena)
+        _TURN  = 4    # 4 × 22° = 88° per burst
+        _SHIFT = 6    # perpendicular lane-shift steps
+        _HALF  = _SWEEP + _TURN + _SHIFT + _TURN   # 54 steps per half-cycle
+
+        local    = self.blind_steps % _HALF
+        half_num = (self.blind_steps // _HALF) % 2   # 0 = even, 1 = odd
+        turn     = "L22" if half_num == 0 else "R22"
+
+        if local < _SWEEP:
+            return "FW"
+        if local < _SWEEP + _TURN:
+            return turn          # first turn: face perpendicular to sweep
+        if local < _SWEEP + _TURN + _SHIFT:
+            return "FW"          # shift one lane
+        return turn              # second turn: face back (176° total)
 
 
 # ── feature builder ───────────────────────────────────────────────────────────
